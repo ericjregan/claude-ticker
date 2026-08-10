@@ -1,0 +1,7 @@
+# Compiled binary — rebuild with: swiftc -O -o ClaudeTicker ClaudeTicker.swift
+ClaudeTicker
+
+# Runtime log written by the LaunchAgent
+ticker.log
+
+.DS_Store
