@@ -325,8 +325,14 @@ final class SessionScanner: @unchecked Sendable {
             return Result(sessions: [], error: "couldn't read sessions")
         }
 
-        let mapped: [Session] = raw.map { r in
+        let mapped: [Session] = raw.compactMap { r -> Session? in
             let isBg = (r.kind == "background")
+
+            // Headless `claude` runs — plugin hooks spawning a reviewer, scripted
+            // `--output-format stream-json` calls — are listed as interactive sessions but
+            // own no terminal. They appear and vanish with a fresh throwaway name each time,
+            // and there is no window to click through to. A real window always has a tty.
+            if !isBg, r.pid.flatMap({ tty(for: $0) }) == nil { return nil }
             let sid0 = r.sessionId ?? r.id ?? ""
             let probe = sid0.isEmpty ? ContextReader.Info()
                                      : context.info(sessionId: sid0, cwd: r.cwd ?? "")
