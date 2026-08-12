@@ -102,7 +102,6 @@ enum Palette {
 // the last assistant message's usage block is the live context total. Files reach tens of
 // MB, so only the tail is read, and only when the file has actually changed.
 
-@MainActor
 final class ContextReader {
     struct Info {
         var percent: Int?
@@ -118,25 +117,24 @@ final class ContextReader {
         let computedAt: Double
     }
 
-    private static let isoFractional: ISO8601DateFormatter = {
+    private let isoFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
-    private static let isoPlain = ISO8601DateFormatter()
+    private let isoPlain = ISO8601DateFormatter()
 
-    static func parseISO(_ s: String) -> Double? {
+    private func parseISO(_ s: String) -> Double? {
         isoFractional.date(from: s)?.timeIntervalSince1970
             ?? isoPlain.date(from: s)?.timeIntervalSince1970
     }
+
     private var cache: [String: Entry] = [:]
 
     /// Context share drifts slowly, so a busy session doesn't need it recomputed every poll —
     /// re-reading multi-MB transcripts that often is the single most expensive thing here.
     private let minimumRecomputeInterval: Double = 12
 
-    /// The transcript's mtime doubles as the session's true last-activity time — more
-    /// meaningful than start time, which says nothing about whether it's still in play.
     func info(sessionId: String, cwd: String) -> Info {
         let now = Date().timeIntervalSince1970
         if let hit = cache[sessionId], now - hit.computedAt < minimumRecomputeInterval {
@@ -216,7 +214,7 @@ final class ContextReader {
             let type = obj["type"] as? String
             if out.lastRole == nil, type == "assistant" || type == "user", obj["message"] != nil {
                 out.lastRole = type
-                if let stamp = obj["timestamp"] as? String { out.lastMessageAt = Self.parseISO(stamp) }
+                if let stamp = obj["timestamp"] as? String { out.lastMessageAt = parseISO(stamp) }
             }
 
             if out.percent == nil,
@@ -237,97 +235,95 @@ final class ContextReader {
     }
 }
 
-// MARK: - Polling
+// MARK: - Scanning
+//
+// Every blocking call lives here: `claude agents --json` alone costs ~300ms, plus osascript,
+// ps, and transcript reads. Run on the main thread that froze the UI for roughly half a
+// second at a time, which is what made the panel feel unlike a native window. All of it now
+// runs on one serial queue — that confinement is what makes @unchecked Sendable honest.
 
-@MainActor
-final class Fleet: ObservableObject {
-    @Published var sessions: [Session] = []
-    @Published var lastError: String?
+final class SessionScanner: @unchecked Sendable {
+    struct Result: Sendable {
+        let sessions: [Session]
+        let error: String?
+    }
 
-    private var timer: Timer?
+    private let queue = DispatchQueue(label: "com.ericregan.claudeticker.scan", qos: .userInitiated)
+    private let context = ContextReader()
     private var claudePath: String?
+    private var resolvedClaude = false
     private var ttyCache: [Int: String] = [:]
     private var titleByTTY: [String: String] = [:]
     private var focusedTTY: String?
-    private var sinceSessionPoll = 99
     private var sinceTerminalPoll = 99
-    private let context = ContextReader()
+    private var dismissed: [String: Double]
 
-    /// sessionId -> the moment it was marked read. Anything Claude says *after* that clears
-    /// the mark, so dismissing is "I've seen this reply", not "mute this session".
-    private var dismissed: [String: Double] =
-        (UserDefaults.standard.dictionary(forKey: "tickerDismissed") as? [String: Double]) ?? [:]
-
-    func markRead(_ session: Session) {
-        dismissed[session.id] = max(session.lastActivity ?? 0, Date().timeIntervalSince1970)
-        UserDefaults.standard.set(dismissed, forKey: "tickerDismissed")
-        refresh()
+    init() {
+        dismissed = (UserDefaults.standard.dictionary(forKey: "tickerDismissed") as? [String: Double]) ?? [:]
     }
 
-    func start() {
-        claudePath = Self.resolveClaude()
-        tickHandler()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tickHandler() }
+    func scan(completion: @escaping @Sendable (Result) -> Void) {
+        queue.async {
+            let result = self.performScan()
+            DispatchQueue.main.async { completion(result) }
         }
     }
 
-    /// `claude agents --json` costs ~300ms per call, so poll fast only when something is
-    /// moving and back off when the whole fleet is parked.
-    private func tickHandler() {
-        sinceSessionPoll += 1
+    /// Records the reply that was seen; anything newer raises the row again.
+    func markRead(id: String, lastActivity: Double?, completion: @escaping @Sendable (Result) -> Void) {
+        queue.async {
+            self.dismissed[id] = max(lastActivity ?? 0, Date().timeIntervalSince1970)
+            UserDefaults.standard.set(self.dismissed, forKey: "tickerDismissed")
+            let result = self.performScan()
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    func focus(pid: Int) {
+        queue.async {
+            guard let dev = self.tty(for: pid) else { return }
+            let script = """
+            tell application "Terminal"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  try
+                    if tty of t is "\(dev)" then
+                      set selected of t to true
+                      set frontmost of w to true
+                      activate
+                      return
+                    end if
+                  end try
+                end repeat
+              end repeat
+            end tell
+            """
+            Self.run("/usr/bin/osascript", ["-e", script])
+        }
+    }
+
+    // MARK: The scan itself
+
+    private func performScan() -> Result {
+        if !resolvedClaude {
+            claudePath = Self.resolveClaude()
+            resolvedClaude = true
+        }
+        guard let claude = claudePath else {
+            return Result(sessions: [], error: "claude not found on PATH")
+        }
+
         sinceTerminalPoll += 1
-
-        let anythingHappening = sessions.contains { $0.state == .needsYou || $0.state == .working }
-        if sinceSessionPoll >= (anythingHappening ? 4 : 10) {
-            sinceSessionPoll = 0
-            refresh()
-        }
-        if sinceTerminalPoll >= 5 {
+        if sinceTerminalPoll >= 2 {
             sinceTerminalPoll = 0
             refreshTerminalState()
-            markFocused()
         }
-    }
 
-    /// GUI processes don't inherit a login PATH, so ask a login shell where claude lives.
-    private static func resolveClaude() -> String? {
-        for candidate in ["\(NSHomeDirectory())/.local/bin/claude",
-                          "/opt/homebrew/bin/claude",
-                          "/usr/local/bin/claude"] where FileManager.default.isExecutableFile(atPath: candidate) {
-            return candidate
-        }
-        let found = run("/bin/zsh", ["-lc", "command -v claude"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (found?.isEmpty == false) ? found : nil
-    }
-
-    @discardableResult
-    static func run(_ launchPath: String, _ args: [String]) -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: launchPath)
-        p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return String(data: data, encoding: .utf8)
-    }
-
-    private func refresh() {
-        guard let claude = claudePath else {
-            lastError = "claude not found on PATH"
-            return
-        }
         guard let out = Self.run(claude, ["agents", "--json"]),
               let data = out.data(using: .utf8),
               let raw = try? JSONDecoder().decode([RawSession].self, from: data) else {
-            lastError = "couldn't read sessions"
-            return
+            return Result(sessions: [], error: "couldn't read sessions")
         }
-        lastError = nil
 
         let mapped: [Session] = raw.map { r in
             let isBg = (r.kind == "background")
@@ -376,6 +372,7 @@ final class Fleet: ObservableObject {
             // A session resumed from an old transcript can have messages older than its own
             // start, so take whichever is more recent as the true "last touched".
             let touched = max(probe.lastMessageAt ?? 0, (r.startedAt ?? 0) / 1000)
+
             return Session(
                 id: sid,
                 name: displayName,
@@ -390,25 +387,20 @@ final class Fleet: ObservableObject {
             )
         }
 
-        publish(mapped + scanCodex())
-    }
-
-    /// Focus has to be stamped *before* ordering, since the window you're in is part of the
-    /// sort key.
-    private func publish(_ list: [Session]) {
-        var marked = list
+        var all = mapped + scanCodex()
         if let front = focusedTTY {
-            marked = list.map { s in
+            all = all.map { s in
                 var copy = s
-                copy.isFocused = s.pid.flatMap { tty(for: $0) } == front
+                copy.isFocused = s.pid.flatMap { self.tty(for: $0) } == front
                 return copy
             }
         }
-        sessions = marked.sorted {
+        all.sort {
             let a = Self.rank($0), b = Self.rank($1)
             if a != b { return a < b }
             return ($0.lastActivity ?? $0.startedAt / 1000) > ($1.lastActivity ?? $1.startedAt / 1000)
         }
+        return Result(sessions: all, error: nil)
     }
 
     /// Priority ladder. Amber stays above the focused window on purpose: a blocked session
@@ -422,7 +414,33 @@ final class Fleet: ObservableObject {
         return 4
     }
 
-    private func markFocused() { publish(sessions) }
+    // MARK: Helpers
+
+    /// GUI processes don't inherit a login PATH, so ask a login shell where claude lives.
+    private static func resolveClaude() -> String? {
+        for candidate in ["\(NSHomeDirectory())/.local/bin/claude",
+                          "/opt/homebrew/bin/claude",
+                          "/usr/local/bin/claude"] where FileManager.default.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+        let found = run("/bin/zsh", ["-lc", "command -v claude"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (found?.isEmpty == false) ? found : nil
+    }
+
+    @discardableResult
+    static func run(_ launchPath: String, _ args: [String]) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: launchPath)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(data: data, encoding: .utf8)
+    }
 
     /// Codex has no `agents --json` equivalent, so interactive CLI sessions are found by
     /// process + tty. Subcommand processes (mcp-server, sandbox, exec…) are helpers, not
@@ -540,29 +558,6 @@ final class Fleet: ObservableObject {
         return t
     }
 
-    // MARK: Click-to-focus
-
-    func focus(_ session: Session) {
-        guard let pid = session.pid, let dev = tty(for: pid) else { return }
-        let script = """
-        tell application "Terminal"
-          repeat with w in windows
-            repeat with t in tabs of w
-              try
-                if tty of t is "\(dev)" then
-                  set selected of t to true
-                  set frontmost of w to true
-                  activate
-                  return
-                end if
-              end try
-            end repeat
-          end repeat
-        end tell
-        """
-        Self.run("/usr/bin/osascript", ["-e", script])
-    }
-
     private func tty(for pid: Int) -> String? {
         if let cached = ttyCache[pid] { return cached }
         guard let out = Self.run("/bin/ps", ["-o", "tty=", "-p", String(pid)])?
@@ -571,6 +566,58 @@ final class Fleet: ObservableObject {
         let dev = "/dev/" + out
         ttyCache[pid] = dev
         return dev
+    }
+}
+
+// MARK: - Fleet
+//
+// Main-actor view model. It owns no blocking work — it schedules scans and publishes results.
+
+@MainActor
+final class Fleet: ObservableObject {
+    @Published var sessions: [Session] = []
+    @Published var lastError: String?
+
+    private let scanner = SessionScanner()
+    private var timer: Timer?
+    private var scanning = false
+    private var sinceSessionPoll = 99
+
+    func start() {
+        tickHandler()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tickHandler() }
+        }
+    }
+
+    /// `claude agents --json` costs ~300ms per call, so poll fast only when something is
+    /// moving and back off when the whole fleet is parked.
+    private func tickHandler() {
+        sinceSessionPoll += 1
+        let anythingHappening = sessions.contains { $0.state == .needsYou || $0.state == .working }
+        guard sinceSessionPoll >= (anythingHappening ? 4 : 10), !scanning else { return }
+        sinceSessionPoll = 0
+        scanning = true
+        scanner.scan { [weak self] result in
+            Task { @MainActor in self?.apply(result) }
+        }
+    }
+
+    func focus(_ session: Session) {
+        guard let pid = session.pid else { return }
+        scanner.focus(pid: pid)
+    }
+
+    func markRead(_ session: Session) {
+        scanner.markRead(id: session.id, lastActivity: session.lastActivity) { [weak self] result in
+            Task { @MainActor in self?.apply(result) }
+        }
+    }
+
+    private func apply(_ result: SessionScanner.Result) {
+        scanning = false
+        lastError = result.error
+        if result.error == nil || !result.sessions.isEmpty { sessions = result.sessions }
     }
 }
 
@@ -658,6 +705,25 @@ extension Notification.Name {
 struct ResizeGrip: NSViewRepresentable {
     func makeNSView(context: Context) -> ResizeGripView { ResizeGripView() }
     func updateNSView(_ nsView: ResizeGripView, context: Context) {}
+}
+
+struct HeaderButton: View {
+    let symbol: String
+    let help: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        ZStack {
+            Image(systemName: symbol)
+                // Faint was too recessive to find — these are the panel's only controls.
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundColor(hovering ? Palette.ink : Palette.dim)
+            MouseArea(onClick: action, onHover: { hovering = $0 })
+        }
+        .frame(width: 18, height: 18)
+        .help(help)
+    }
 }
 
 struct Chip: View {
@@ -805,20 +871,15 @@ struct TickerView: View {
                         .font(.system(size: 9))
                         .foregroundColor(Palette.faint)
                 }
-                Button(action: { ui.collapsed.toggle() }) {
-                    Image(systemName: ui.collapsed ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 8.5, weight: .bold))
-                        .foregroundColor(Palette.faint)
+                // AppKit hit targets, not SwiftUI Buttons: a Button in a non-activating panel
+                // waits for the window to become key, so the first click appears to do nothing.
+                HeaderButton(symbol: ui.collapsed ? "chevron.down" : "chevron.up",
+                             help: ui.collapsed ? "Show sessions" : "Collapse to header") {
+                    ui.collapsed.toggle()
                 }
-                .buttonStyle(.plain)
-                .help(ui.collapsed ? "Show sessions" : "Collapse to header")
-                Button(action: { NSApp.terminate(nil) }) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8.5, weight: .bold))
-                        .foregroundColor(Palette.faint)
+                HeaderButton(symbol: "xmark", help: "Quit ticker") {
+                    NSApp.terminate(nil)
                 }
-                .buttonStyle(.plain)
-                .help("Quit ticker")
             }
             .padding(.horizontal, 12)
             .padding(.top, 9)
