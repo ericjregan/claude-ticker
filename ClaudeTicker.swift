@@ -248,7 +248,7 @@ final class SessionScanner: @unchecked Sendable {
         let error: String?
     }
 
-    private let queue = DispatchQueue(label: "com.ericregan.claudeticker.scan", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.claude-ticker.scan", qos: .userInitiated)
     private let context = ContextReader()
     private var claudePath: String?
     private var resolvedClaude = false
@@ -359,7 +359,7 @@ final class SessionScanner: @unchecked Sendable {
                 state = .idle
             }
 
-            // Unnamed sessions get a throwaway auto-name ("ericregan-48"); the
+            // Unnamed sessions get a throwaway auto-name ("myproject-3f"); the
             // Terminal window title holds the real topic, so prefer that.
             var displayName = r.name ?? "untitled"
             if Self.isAutoName(displayName, cwd: r.cwd ?? ""),
@@ -533,7 +533,7 @@ final class SessionScanner: @unchecked Sendable {
         titleByTTY = map
     }
 
-    /// "ericregan — ⠂ Sidebar question — caffeinate ◂ claude — 97×23" -> "Sidebar question"
+    /// "myproject — ⠂ Fix the login redirect — caffeinate ◂ claude — 97×23" -> "Fix the login redirect"
     static func topic(fromWindowTitle title: String) -> String? {
         let parts = title.components(separatedBy: " — ")
         guard parts.count >= 3 else { return nil }

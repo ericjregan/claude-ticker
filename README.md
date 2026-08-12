@@ -6,16 +6,21 @@ windows stay legible at a glance. Single-file Swift (AppKit + SwiftUI), no depen
 Each row is one session: status rail, name, context usage, and what it wants from you.
 Click a row to raise its Terminal window. Click the checkmark on an amber row to mark it read.
 
-## Build and install
+## Install
+
+Requires macOS and the Xcode Command Line Tools (`xcode-select --install`). No other
+dependencies — it compiles with the `swiftc` that ships with them.
 
 ```sh
-swiftc -O -o ClaudeTicker ClaudeTicker.swift          # build
-cp com.ericregan.claudeticker.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.ericregan.claudeticker.plist
+./install.sh
 ```
 
-Restart after a rebuild with `launchctl unload` then `load`. The plist hardcodes an absolute
-path to the binary — edit it if the checkout moves.
+That builds the binary, registers a login agent, and starts it. It works from wherever you
+cloned or unzipped this; nothing is hardcoded to a particular user or directory. Run it again
+after editing the source to rebuild and restart. `./uninstall.sh` removes the agent.
+
+Handing this repo to your own Claude Code session and asking it to install and explain the
+panel works too — that is what it was built for.
 
 ## Design rules
 
