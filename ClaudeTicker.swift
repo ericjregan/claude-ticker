@@ -193,8 +193,14 @@ final class ContextReader {
 
         let start = size > window ? size - window : 0
         try? handle.seek(toOffset: start)
-        guard let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return Info() }
+        guard let data = try? handle.readToEnd() else { return Info() }
+        // Decode leniently. The seek lands on an arbitrary byte, and these transcripts are
+        // dense with em-dashes and spinner glyphs, so a strict String(data:encoding:) returns
+        // nil whenever the offset splits a UTF-8 sequence. That empty result then gets cached
+        // against the current file size and latches until the file next grows — i.e. the
+        // "your turn" for that reply never appears. Replacement characters land in the
+        // partial first line, which fails JSON parsing and is skipped anyway.
+        let text = String(decoding: data, as: UTF8.self)
 
         var out = Info()
 
@@ -326,15 +332,22 @@ final class TranscriptWatcher: @unchecked Sendable {
         queue.async {
             let wanted = Set(paths)
             guard wanted != self.watched || self.needsRearm else { return }
-            self.watched = wanted
             self.needsRearm = false
 
             self.sources.forEach { $0.cancel() }
             self.sources = []
 
+            // Record what was actually opened, not what was asked for. Claiming a path that
+            // failed to open would satisfy the guard above forever, so a transcript that was
+            // mid-rotation at re-arm time would silently lose event-driven updates for the
+            // rest of the process — a failed open therefore keeps needsRearm set.
+            var armed: Set<String> = []
+            defer { self.watched = armed }
+
             for path in wanted {
                 let fd = open(path, O_EVTONLY)
-                guard fd >= 0 else { continue }
+                guard fd >= 0 else { self.needsRearm = true; continue }
+                armed.insert(path)
                 let source = DispatchSource.makeFileSystemObjectSource(
                     fileDescriptor: fd,
                     eventMask: [.extend, .write, .delete, .rename],
@@ -776,8 +789,12 @@ final class Fleet: ObservableObject {
         lastError = result.error
         if result.error == nil || !result.sessions.isEmpty { sessions = result.sessions }
         // Follow the fleet: sessions that ended stop being watched, new ones start.
-        watcher?.watch(paths: sessions.compactMap {
-            ContextReader.transcriptURL(sessionId: $0.id, cwd: $0.cwd)?.path
+        watcher?.watch(paths: sessions.compactMap { session in
+            // Codex rows own no transcript — no session id, no cwd. Asking the locator about
+            // them costs a 97-directory sweep on the main actor, repeated every retry window,
+            // for a file that cannot exist.
+            guard session.tag != "codex" else { return nil }
+            return ContextReader.transcriptURL(sessionId: session.id, cwd: session.cwd)?.path
         })
     }
 }
@@ -1352,33 +1369,42 @@ final class StatusItemController {
 
         // Both are needed: an error with no sessions never reassigns `sessions`, so watching
         // that alone would leave a stale count sitting in the menu bar.
+        //
+        // Each handler renders from the value it was HANDED, never by reading back through
+        // `fleet`. Combine publishes in `willSet`, so inside these closures the property being
+        // announced still holds its old value — reading `fleet.lastError` here was exactly the
+        // bug this pair was written to prevent, one poll cycle late.
         fleet.$sessions
             .sink { [weak self] sessions in
-                MainActor.assumeIsolated { self?.render(sessions: sessions) }
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    // lastError is assigned before sessions in Fleet.apply, so it is current.
+                    self.render(sessions: sessions, error: self.fleet.lastError)
+                }
             }
             .store(in: &observers)
         fleet.$lastError
-            .sink { [weak self] _ in
+            .sink { [weak self] error in
                 MainActor.assumeIsolated {
                     guard let self else { return }
-                    self.render(sessions: self.fleet.sessions)
+                    self.render(sessions: self.fleet.sessions, error: error)
                 }
             }
             .store(in: &observers)
 
-        render(sessions: fleet.sessions)
+        render(sessions: fleet.sessions, error: fleet.lastError)
     }
 
     // MARK: Readout
 
-    private func render(sessions: [Session]) {
+    private func render(sessions: [Session], error: String?) {
         guard let button = statusItem.button else { return }
-        if fleet.lastError != nil, sessions.isEmpty {
+        if error != nil, sessions.isEmpty {
             // A lying "0·0" would read as a quiet fleet. A dash reads as "no answer".
             button.attributedTitle = NSAttributedString(
                 string: " —",
                 attributes: [.font: Self.numberFont(.regular)])
-            button.toolTip = fleet.lastError
+            button.toolTip = error
             return
         }
         button.attributedTitle = Self.readout(waiting: sessions.waitingCount,
@@ -1554,7 +1580,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.ui.collapsed = false
                     }
                     if !self.ui.collapsed { self.expandedHeight = self.panel.frame.height }
-                    UserDefaults.standard.set(NSStringFromRect(self.panel.frame), forKey: "tickerFrame")
+
+                    // Persist the expanded rect even while collapsed. `collapsed` itself is not
+                    // saved, so a restored 54pt frame would come back paired with an expanded
+                    // layout and lose whatever height was chosen before collapsing — moving a
+                    // collapsed panel is enough to trigger it.
+                    let f = self.panel.frame
+                    let toSave = self.ui.collapsed
+                        ? NSRect(x: f.minX, y: f.maxY - self.expandedHeight,
+                                 width: f.width, height: self.expandedHeight)
+                        : f
+                    UserDefaults.standard.set(NSStringFromRect(toSave), forKey: "tickerFrame")
                 }
             }
         }
