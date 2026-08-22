@@ -16,6 +16,51 @@ you ask for it, and its ✕ puts it away again without quitting the menu bar ite
 Updates are event-driven: the app watches each session's transcript and refreshes when one is
 written to, so "your turn" appears as the reply lands rather than on the next poll.
 
+## How It All Connects
+
+```
+   claude agents --json                    session transcripts (.jsonl)
+   roster · status · cwd                   context % · who spoke last
+              │                                        │
+              └────────────────────┬───────────────────┘
+                                   ▼
+                           SessionScanner
+              every blocking call, on one serial queue
+                                   │
+                                   ▼
+                                 Fleet
+                  @MainActor · publishes · never blocks
+                                   │
+                 ┌─────────────────┴─────────────────┐
+                 ▼                                   ▼
+          Menu bar item                       Floating panel
+          ⌃⌃  8 · 1  + popover                always-on-top list
+
+                           TranscriptWatcher
+              DispatchSource on each live transcript —
+              a reply lands, the row changes, no polling
+```
+
+| Piece | What it does |
+|-------|--------------|
+| **Menu bar item** | Two numbers behind a double chevron — waiting, then working. Amber appears here and nowhere else. |
+| **Popover** | The full list. One row per session: status, name, context remaining. |
+| **Floating panel** | The same list in an always-on-top window, summoned when you want it permanently in view. |
+| **Transcript watcher** | Refreshes the moment a reply lands, rather than on the next poll. |
+
+## What a row tells you
+
+| You see | It means |
+|---------|----------|
+| `needs you · permission` | Blocked on a permission prompt. Nothing proceeds until you answer. |
+| `waiting for you` | A background agent finished. Its results are unread. |
+| `your turn` | Claude replied and is waiting on you. |
+| `working` | Currently generating. |
+| dimmed name | No real message in 48 hours — effectively abandoned. |
+| `74%` | Share of the context window in use. Red at 85%. |
+
+Amber means exactly one thing: that session wants you.
+
 ## Install
 
 Requires macOS and the Xcode Command Line Tools (`xcode-select --install`). No other
@@ -41,3 +86,7 @@ implementation.
 Worth knowing up front: `claude agents --json` only ever reports `busy` or `idle` for terminal
 sessions, so "waiting on you" cannot come from the CLI. It is derived from who spoke last in
 each session's transcript. The docs explain that and the rest.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
