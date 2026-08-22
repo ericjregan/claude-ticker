@@ -1348,7 +1348,9 @@ final class StatusItemController {
         self.isPanelVisible = isPanelVisible
         self.onShowPanel = onShowPanel
         self.onHidePanel = onHidePanel
-        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        self.statusItem = NSStatusBar.system.statusItem(withLength: StatusItemController.itemWidth)
+        // Lets a ⌘-drag to a different spot in the menu bar survive a restart.
+        statusItem.autosaveName = "ClaudeTickerStatusItem"
 
         if let button = statusItem.button {
             button.image = MissionMark.image()
@@ -1399,6 +1401,9 @@ final class StatusItemController {
 
     private func render(sessions: [Session], error: String?) {
         guard let button = statusItem.button else { return }
+        // Pinned every render, not once at init: a content-sized item would grow with the
+        // counts and get dropped by a full menu bar at the worst possible moment.
+        statusItem.length = Self.itemWidth
         if error != nil, sessions.isEmpty {
             // A lying "0·0" would read as a quiet fleet. A dash reads as "no answer".
             button.attributedTitle = NSAttributedString(
@@ -1410,6 +1415,19 @@ final class StatusItemController {
         button.attributedTitle = Self.readout(waiting: sessions.waitingCount,
                                               working: sessions.workingCount)
         button.toolTip = sessions.summaryLine
+    }
+
+    /// A full menu bar drops what does not fit — silently, with no error and no truncation, so
+    /// the item simply is not drawn. Measured on an eleven-icon bar: 33pt rendered, 62pt did
+    /// not. So the readout is pinned to a constant width rather than sized to its content.
+    /// Letting it grow would make it disappear exactly when the counts get interesting, which
+    /// is the one moment it has to be on screen.
+    ///
+    /// Override with `defaults write ClaudeTicker statusItemWidth 48` if there is room to
+    /// spare; 0 restores content-sized width.
+    static var itemWidth: CGFloat {
+        let stored = UserDefaults.standard.double(forKey: "statusItemWidth")
+        return stored > 0 ? stored : 52
     }
 
     private static func numberFont(_ weight: NSFont.Weight) -> NSFont {
@@ -1427,8 +1445,10 @@ final class StatusItemController {
         var amberAttributes: [NSAttributedString.Key: Any] = [.font: numberFont(.semibold)]
         amberAttributes[.foregroundColor] = amber
 
+        // No leading space — `imagePosition = .imageLeading` already supplies the gap, and at a
+        // pinned width every point spent on padding is a point stolen from the digits.
         out.append(NSAttributedString(
-            string: " \(waiting)",
+            string: "\(waiting)",
             attributes: waiting > 0 ? amberAttributes : [.font: numberFont(.regular)]))
         out.append(NSAttributedString(
             string: "·\(working)",

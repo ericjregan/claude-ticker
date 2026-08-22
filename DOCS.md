@@ -137,6 +137,9 @@ All in `ClaudeTicker.swift`:
 | Context warning color | `RowView.contextColor` | red at 85% |
 | Context window sizes | `ContextReader.millionTokenModels` | 1M for Claude 5 family |
 | Menu bar mark weight | `MissionMark.strokeWidth` | 8 (brand file draws it at 10) |
+| Menu bar mark height | `MissionMark.image(height:)` | 13pt |
+| Menu bar readout size | `StatusItemController.numberFont` | 12pt |
+| Menu bar item width | `defaults write ClaudeTicker statusItemWidth 58` | 52pt (0 = size to content) |
 | Popover size | `PopoverMetrics` | 330pt wide, 470pt tall max |
 | Colors | `Palette` | — |
 
@@ -163,8 +166,15 @@ to searching every project directory by session id, so this now means the file g
 there — a session too new to have written one, or one whose transcript was deleted.
 
 **The menu bar item vanished but the app is running.** The panel's ✕ only hides the panel; the
-menu bar item is the app. If the item itself is missing, the menu bar is full and macOS has
-hidden it behind the notch — remove another item.
+menu bar item is the app. If the item itself is gone, the menu bar is out of room: macOS drops
+what does not fit **silently** — no error, no truncation, and accessibility still reports the
+item at a correct position and size, so only a screenshot tells you it is not being drawn.
+Measured on an eleven-icon bar, 42pt rendered and 46pt did not; installing Docker Desktop was
+enough to push the ticker out. Free a slot (System Settings → Control Center, or hide Siri with
+`defaults write com.apple.Siri StatusMenuVisible -bool false`), or shrink `statusItemWidth`.
+
+This is why the item is pinned to a constant width instead of sizing to its content: a readout
+that grows with the counts would disappear exactly when the counts get interesting.
 
 **The floating panel will not come back.** Right-click the chevron → Show floating panel. Its
 visibility persists in `tickerPanelVisible`, and it starts hidden on a fresh install.
