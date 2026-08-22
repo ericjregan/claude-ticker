@@ -131,22 +131,21 @@ final class ContextReader {
 
     private var cache: [String: Entry] = [:]
 
-    /// Context share drifts slowly, so a busy session doesn't need it recomputed every poll —
-    /// re-reading multi-MB transcripts that often is the single most expensive thing here.
-    private let minimumRecomputeInterval: Double = 12
-
     func info(sessionId: String, cwd: String) -> Info {
         let now = Date().timeIntervalSince1970
-        if let hit = cache[sessionId], now - hit.computedAt < minimumRecomputeInterval {
-            return hit.info
-        }
-        guard let url = transcriptURL(sessionId: sessionId, cwd: cwd) else { return Info() }
+        guard let url = Self.transcriptURL(sessionId: sessionId, cwd: cwd) else { return Info() }
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = (attrs[.size] as? NSNumber)?.uint64Value,
               let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970
         else { return Info() }
 
-        if let hit = cache[sessionId], hit.size == size, hit.mtime == mtime {
+        // Transcripts are append-only, so the byte count is the entire freshness test: an
+        // unchanged size means the newest message is the one already parsed. Stat costs
+        // microseconds, so this can run every scan. It replaces a fixed 12s recompute timer
+        // that made "your turn" arrive up to twelve seconds after the reply actually landed —
+        // mtime is deliberately not part of the test, because a transcript can be touched
+        // without gaining a message.
+        if let hit = cache[sessionId], hit.size == size {
             cache[sessionId] = Entry(size: size, mtime: mtime, info: hit.info, computedAt: now)
             return hit.info
         }
@@ -156,13 +155,8 @@ final class ContextReader {
         return scan
     }
 
-    /// Claude stores transcripts under a slug of the cwd: "/" and "." both become "-".
-    private func transcriptURL(sessionId: String, cwd: String) -> URL? {
-        guard !cwd.isEmpty else { return nil }
-        let slug = cwd.replacingOccurrences(of: "/", with: "-")
-                      .replacingOccurrences(of: ".", with: "-")
-        return URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".claude/projects/\(slug)/\(sessionId).jsonl")
+    static func transcriptURL(sessionId: String, cwd: String) -> URL? {
+        TranscriptLocator.shared.url(sessionId: sessionId, cwd: cwd)
     }
 
     /// Transcripts record `message.model` without the `[1m]` suffix, so the window size has
@@ -232,6 +226,143 @@ final class ContextReader {
             if out.percent != nil, out.lastRole != nil { break }
         }
         return out
+    }
+}
+
+// MARK: - Finding a session's transcript
+//
+// Claude slugs the transcript directory from the cwd — but the cwd the session was *started*
+// in, not the one it reports now. A session that moved, or was resumed from somewhere else,
+// keeps its original file: of eleven live sessions, two resolved by slug alone to paths that
+// did not exist, which is why those windows showed no context % and could never report "your
+// turn". The slug stays as the fast guess; a search by session id is the answer when it
+// misses. Both results are cached, so the 97-directory scan happens at most once per session.
+
+final class TranscriptLocator: @unchecked Sendable {
+    static let shared = TranscriptLocator()
+
+    private struct Entry {
+        let url: URL?
+        let resolvedAt: Double
+    }
+
+    private let lock = NSLock()
+    private var cache: [String: Entry] = [:]
+    /// Rows that own no transcript at all — Codex sessions — must not re-run the search on
+    /// every scan, but a session whose file has not been created yet deserves another look.
+    private let missRetryInterval: Double = 30
+
+    private var root: URL {
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/projects")
+    }
+
+    func url(sessionId: String, cwd: String) -> URL? {
+        guard !sessionId.isEmpty else { return nil }
+        let now = Date().timeIntervalSince1970
+
+        lock.lock()
+        if let hit = cache[sessionId], hit.url != nil || now - hit.resolvedAt < missRetryInterval {
+            lock.unlock()
+            return hit.url
+        }
+        lock.unlock()
+
+        let found = locate(sessionId: sessionId, cwd: cwd)
+
+        lock.lock()
+        cache[sessionId] = Entry(url: found, resolvedAt: now)
+        lock.unlock()
+        return found
+    }
+
+    private func locate(sessionId: String, cwd: String) -> URL? {
+        let fm = FileManager.default
+
+        if !cwd.isEmpty {
+            let slug = cwd.replacingOccurrences(of: "/", with: "-")
+                          .replacingOccurrences(of: ".", with: "-")
+            let guess = root.appendingPathComponent("\(slug)/\(sessionId).jsonl")
+            if fm.fileExists(atPath: guess.path) { return guess }
+        }
+
+        let dirs = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
+        for dir in dirs {
+            let candidate = dir.appendingPathComponent("\(sessionId).jsonl")
+            if fm.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return nil
+    }
+}
+
+// MARK: - Transcript watching
+//
+// Polling alone is what made the panel feel slow: a reply landing just after a scan stayed
+// invisible until the next one came around, up to ten seconds later. Transcripts turn out to
+// be quiet — measured across an eleven-session fleet, only the one genuinely active file
+// changed at all over ten seconds — so watching them costs almost nothing and turns "your
+// turn" into an event instead of something discovered a poll cycle late.
+//
+// The timer stays as the backstop. A window opening or closing writes nothing to an existing
+// transcript, so roster changes are still found by polling.
+
+final class TranscriptWatcher: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.claude-ticker.watch")
+    private var sources: [DispatchSourceFileSystemObject] = []
+    private var watched: Set<String> = []
+    private var needsRearm = false
+    private var pending = false
+    private let debounce: Double
+    private let onChange: @Sendable () -> Void
+
+    init(debounce: Double = 0.35, onChange: @escaping @Sendable () -> Void) {
+        self.debounce = debounce
+        self.onChange = onChange
+    }
+
+    /// Re-arms only when the watched set actually changes, so the common case — a scan that
+    /// found exactly the sessions it found last time — tears down and rebuilds nothing.
+    func watch(paths: [String]) {
+        queue.async {
+            let wanted = Set(paths)
+            guard wanted != self.watched || self.needsRearm else { return }
+            self.watched = wanted
+            self.needsRearm = false
+
+            self.sources.forEach { $0.cancel() }
+            self.sources = []
+
+            for path in wanted {
+                let fd = open(path, O_EVTONLY)
+                guard fd >= 0 else { continue }
+                let source = DispatchSource.makeFileSystemObjectSource(
+                    fileDescriptor: fd,
+                    eventMask: [.extend, .write, .delete, .rename],
+                    queue: self.queue)
+                source.setEventHandler { [weak self, weak source] in
+                    guard let self else { return }
+                    // A replaced or rotated transcript needs a fresh descriptor — the old one
+                    // still points at the unlinked inode and would go silent forever.
+                    if let data = source?.data, data.contains(.delete) || data.contains(.rename) {
+                        self.needsRearm = true
+                    }
+                    self.schedule()
+                }
+                source.setCancelHandler { close(fd) }
+                source.resume()
+                self.sources.append(source)
+            }
+        }
+    }
+
+    /// A streaming reply writes in bursts; collapsing them means one scan per reply, not one
+    /// per chunk.
+    private func schedule() {
+        guard !pending else { return }
+        pending = true
+        queue.asyncAfter(deadline: .now() + debounce) {
+            self.pending = false
+            self.onChange()
+        }
     }
 }
 
@@ -588,8 +719,13 @@ final class Fleet: ObservableObject {
     private var timer: Timer?
     private var scanning = false
     private var sinceSessionPoll = 99
+    private var watcher: TranscriptWatcher?
+    private var lastScanStart: Double = 0
 
     func start() {
+        watcher = TranscriptWatcher { [weak self] in
+            Task { @MainActor in self?.transcriptChanged() }
+        }
         tickHandler()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tickHandler() }
@@ -597,13 +733,27 @@ final class Fleet: ObservableObject {
     }
 
     /// `claude agents --json` costs ~300ms per call, so poll fast only when something is
-    /// moving and back off when the whole fleet is parked.
+    /// moving and back off when the whole fleet is parked. With the watcher carrying the
+    /// live updates, this cadence only has to catch sessions appearing and disappearing.
     private func tickHandler() {
         sinceSessionPoll += 1
         let anythingHappening = sessions.contains { $0.state == .needsYou || $0.state == .working }
         guard sinceSessionPoll >= (anythingHappening ? 4 : 10), !scanning else { return }
+        beginScan()
+    }
+
+    /// A transcript grew, so something was genuinely said. Scan now instead of waiting out
+    /// the rest of the interval — this is what makes "your turn" land as it happens. The
+    /// floor stops a long reply from queuing back-to-back scans.
+    private func transcriptChanged() {
+        guard !scanning, Date().timeIntervalSince1970 - lastScanStart >= 1.0 else { return }
+        beginScan()
+    }
+
+    private func beginScan() {
         sinceSessionPoll = 0
         scanning = true
+        lastScanStart = Date().timeIntervalSince1970
         scanner.scan { [weak self] result in
             Task { @MainActor in self?.apply(result) }
         }
@@ -624,6 +774,10 @@ final class Fleet: ObservableObject {
         scanning = false
         lastError = result.error
         if result.error == nil || !result.sessions.isEmpty { sessions = result.sessions }
+        // Follow the fleet: sessions that ended stop being watched, new ones start.
+        watcher?.watch(paths: sessions.compactMap {
+            ContextReader.transcriptURL(sessionId: $0.id, cwd: $0.cwd)?.path
+        })
     }
 }
 
