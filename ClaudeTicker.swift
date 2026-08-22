@@ -1043,6 +1043,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NotificationCenter.default.addObserver(forName: note, object: panel, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self, !self.isRepositioning else { return }
+                    // Dragging the panel taller is a request to see the sessions again.
+                    // `.resizable` is in the style mask, so the OS corner resizes the window
+                    // even while collapsed hides the SwiftUI grip — without this, that drag
+                    // grows a collapsed panel into a tall empty box with no way back except
+                    // the chevron. Adopt the dragged height first so applyCollapse(false)
+                    // sees no change and leaves the size the user just chose alone.
+                    if self.ui.collapsed, self.panel.frame.height > self.collapsedHeight + 20 {
+                        self.expandedHeight = self.panel.frame.height
+                        self.ui.collapsed = false
+                    }
                     if !self.ui.collapsed { self.expandedHeight = self.panel.frame.height }
                     UserDefaults.standard.set(NSStringFromRect(self.panel.frame), forKey: "tickerFrame")
                 }
