@@ -1,12 +1,20 @@
 # Claude Ticker
 
-An always-on-top macOS panel listing every running Claude Code session, so a dozen Terminal
-windows stay legible at a glance. Single-file Swift (AppKit + SwiftUI), no dependencies.
+A macOS menu bar item listing every running Claude Code session, so a dozen Terminal windows
+stay legible at a glance. Single-file Swift (AppKit + SwiftUI), no dependencies.
 
-Each row is one session: status, name, and how much of its context window is left. Amber
-means that session wants you — blocked on a permission prompt, finished and unread, or
-waiting on your reply. Click a row to raise its Terminal window; click the checkmark to mark
-it read.
+The menu bar shows two numbers — sessions waiting on you, and sessions still working — behind
+a double chevron. The waiting count turns amber when it is above zero, and that is the only
+place amber appears. Click for the full list; each row is one session with its status, name,
+and how much of its context window is left. Click a row to raise its Terminal window; click
+the checkmark to mark it read.
+
+Right-click the chevron to quit, or to summon the original floating panel — an always-on-top
+window with the same list, for when you want it permanently in view. It stays hidden until
+you ask for it, and its ✕ puts it away again without quitting the menu bar item.
+
+Updates are event-driven: the app watches each session's transcript and refreshes when one is
+written to, so "your turn" appears as the reply lands rather than on the next poll.
 
 ## Install
 

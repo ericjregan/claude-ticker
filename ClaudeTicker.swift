@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 // MARK: - Model
@@ -781,6 +782,75 @@ final class Fleet: ObservableObject {
     }
 }
 
+// MARK: - The menu bar mark
+//
+// Mission Software Solutions' double chevron, taken from the brand file
+// (mission-software-site/public/logo-mark.svg) rather than redrawn. The source strokes it at
+// 10, which closes the gap at menu bar size — the lower chevron's apex sits at y=25 while the
+// upper chevron's legs end at y=30 — so it is cut to 8 here. A Claude-style starburst was the
+// first attempt and was wrong: it reads as a second Claude icon next to the real one.
+//
+// Template, so macOS tints it for a light or dark menu bar. Amber is spent on the number and
+// never on the mark, which stays constant so the item is always recognisable as this one.
+
+enum MissionMark {
+    /// viewBox "3 3 58 49" — the origin offset matters, or the mark sits off-centre.
+    private static let box = CGRect(x: 3, y: 3, width: 58, height: 49)
+    private static let strokeWidth: CGFloat = 8
+
+    static func image(height: CGFloat = 13) -> NSImage {
+        let scale = height / box.height
+        let size = NSSize(width: (box.width * scale).rounded(), height: height)
+
+        // flipped: true puts the origin top-left with y increasing downward, which is the
+        // SVG's own coordinate system — so the path points transcribe directly.
+        let image = NSImage(size: size, flipped: true) { _ in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return true }
+            ctx.scaleBy(x: scale, y: scale)
+            ctx.translateBy(x: -box.minX, y: -box.minY)
+            ctx.setLineWidth(strokeWidth)
+            ctx.setLineJoin(.miter)
+            ctx.setStrokeColor(NSColor.black.cgColor)   // template: only the alpha survives
+            // "M8 47 L32 25 L56 47" and "M8 30 L32 8 L56 30" — same chevron, 17 apart.
+            for apexY: CGFloat in [25, 8] {
+                ctx.move(to: CGPoint(x: 8, y: apexY + 22))
+                ctx.addLine(to: CGPoint(x: 32, y: apexY))
+                ctx.addLine(to: CGPoint(x: 56, y: apexY + 22))
+            }
+            ctx.strokePath()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+}
+
+// MARK: - Headline numbers
+//
+// Three surfaces report the same counts — the panel header, the popover header, and the menu
+// bar readout. Defining them once is what keeps them from drifting apart. These hang off the
+// array rather than off Fleet because Combine delivers @Published values in `willSet`: a
+// subscriber reading `fleet.sessions` sees the OLD list, so the menu bar has to count the
+// array it was handed.
+
+extension Array where Element == Session {
+    var waitingCount: Int { filter { $0.state.wantsYou }.count }
+    var workingCount: Int { filter { $0.state == .working }.count }
+
+    var summaryLine: String {
+        var parts: [String] = []
+        if waitingCount > 0 { parts.append("\(waitingCount) waiting on you") }
+        if workingCount > 0 { parts.append("\(workingCount) working") }
+        parts.append("\(count) total")
+        return parts.joined(separator: " · ")
+    }
+}
+
+extension Fleet {
+    var needsAttention: Bool { sessions.waitingCount > 0 }
+    var summaryLine: String { sessions.summaryLine }
+}
+
 // MARK: - Views
 
 /// SwiftUI tap gestures never fire in a non-activating panel that isn't key, so clicks are
@@ -860,6 +930,8 @@ final class ResizeGripView: NSView {
 
 extension Notification.Name {
     static let tickerDidResize = Notification.Name("tickerDidResize")
+    /// Posted by the panel's ✕. The delegate owns the window, so it does the hiding.
+    static let tickerHidePanel = Notification.Name("tickerHidePanel")
 }
 
 struct ResizeGrip: NSViewRepresentable {
@@ -1002,19 +1074,8 @@ struct TickerView: View {
     @ObservedObject var fleet: Fleet
     @ObservedObject var ui: UIState
 
-    private var needsAttention: Bool {
-        fleet.sessions.contains { $0.state.wantsYou }
-    }
-
-    private var counts: String {
-        let needs = fleet.sessions.filter { $0.state.wantsYou }.count
-        let busy  = fleet.sessions.filter { $0.state == .working }.count
-        var parts: [String] = []
-        if needs > 0 { parts.append("\(needs) waiting on you") }
-        if busy  > 0 { parts.append("\(busy) working") }
-        parts.append("\(fleet.sessions.count) total")
-        return parts.joined(separator: " · ")
-    }
+    private var needsAttention: Bool { fleet.needsAttention }
+    private var counts: String { fleet.summaryLine }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1037,8 +1098,10 @@ struct TickerView: View {
                              help: ui.collapsed ? "Show sessions" : "Collapse to header") {
                     ui.collapsed.toggle()
                 }
-                HeaderButton(symbol: "xmark", help: "Quit ticker") {
-                    NSApp.terminate(nil)
+                // Hides the panel, it does not quit: the menu bar item is the ticker now, and
+                // closing this window must not take it down with it. Quit lives on the chevron.
+                HeaderButton(symbol: "xmark", help: "Hide panel — the menu bar item keeps running") {
+                    NotificationCenter.default.post(name: .tickerHidePanel, object: nil)
                 }
             }
             .padding(.horizontal, 12)
@@ -1141,12 +1204,287 @@ final class TickerPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+// MARK: - The drop-down
+//
+// The menu bar's list. Same RowView as the panel — one row definition, two containers — minus
+// the panel's chrome: a popover is sized and dismissed by the system, so it needs no collapse
+// chevron and no resize grip.
+
+struct FooterButton: View {
+    let title: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 10.5))
+            .foregroundColor(hovering ? Palette.ink : Palette.dim)
+            // MouseArea rather than a Button for the same reason the panel uses it: an AppKit
+            // hit target fires on the first click, whatever the window's key state.
+            .overlay(MouseArea(onClick: action, onHover: { hovering = $0 }))
+    }
+}
+
+struct PopoverView: View {
+    @ObservedObject var fleet: Fleet
+    let onShowPanel: () -> Void
+    let onQuit: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("CLAUDE SESSIONS")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundColor(fleet.needsAttention ? Palette.amber : Palette.dim)
+                Text(fleet.summaryLine)
+                    .font(.system(size: 10))
+                    .foregroundColor(fleet.needsAttention ? Palette.amber.opacity(0.85) : Palette.faint)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.top, 9)
+            .padding(.bottom, 8)
+
+            Rectangle().fill(Palette.faint.opacity(0.28)).frame(height: 0.5)
+
+            if let err = fleet.lastError {
+                Text(err)
+                    .font(.system(size: 11))
+                    .foregroundColor(Palette.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+            } else if fleet.sessions.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("No sessions running.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Palette.dim)
+                    Text("Start one in any terminal.")
+                        .font(.system(size: 10))
+                        .foregroundColor(Palette.faint)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(fleet.sessions) { s in
+                            RowView(session: s,
+                                    onTap: { fleet.focus(s) },
+                                    onMarkRead: { fleet.markRead(s) })
+                        }
+                    }
+                }
+                .frame(maxHeight: .infinity)
+            }
+
+            Rectangle().fill(Palette.faint.opacity(0.28)).frame(height: 0.5)
+            HStack(spacing: 0) {
+                FooterButton(title: "Show panel", action: onShowPanel)
+                Spacer()
+                FooterButton(title: "Quit", action: onQuit)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+        }
+        .frame(width: PopoverMetrics.width)
+        .background(Color(red: 0.09, green: 0.09, blue: 0.10))
+    }
+}
+
+/// Shared between the SwiftUI view and the NSPopover that has to be told its size in points.
+enum PopoverMetrics {
+    static let width: CGFloat = 330
+    static let header: CGFloat = 44
+    static let footer: CGFloat = 31
+    static let row: CGFloat = 30          // RowView is a fixed 30pt
+    static let maxHeight: CGFloat = 470
+
+    static func size(rows: Int) -> NSSize {
+        let body = CGFloat(max(rows, 1)) * row
+        return NSSize(width: width, height: min(header + body + footer, maxHeight))
+    }
+}
+
+// MARK: - Menu bar item
+
+@MainActor
+final class StatusItemController {
+    private let fleet: Fleet
+    private let isPanelVisible: () -> Bool
+    private let onShowPanel: () -> Void
+    private let onHidePanel: () -> Void
+
+    private let statusItem: NSStatusItem
+    private let popover = NSPopover()
+    private var observers: [AnyCancellable] = []
+
+    /// The one place amber appears outside the panel. Fixed, not a system colour: it means
+    /// "act now" and has to look the same on every menu bar.
+    private static let amber = NSColor(srgbRed: 1.0, green: 0.690, blue: 0.125, alpha: 1)
+
+    init(fleet: Fleet,
+         isPanelVisible: @escaping () -> Bool,
+         onShowPanel: @escaping () -> Void,
+         onHidePanel: @escaping () -> Void) {
+        self.fleet = fleet
+        self.isPanelVisible = isPanelVisible
+        self.onShowPanel = onShowPanel
+        self.onHidePanel = onHidePanel
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+        if let button = statusItem.button {
+            button.image = MissionMark.image()
+            button.imagePosition = .imageLeading
+            button.target = self
+            button.action = #selector(clicked)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+
+        popover.behavior = .transient
+        popover.animates = false
+        // The list is a dark HUD wherever it opens, matching the panel it mirrors.
+        popover.appearance = NSAppearance(named: .darkAqua)
+        popover.contentViewController = NSHostingController(
+            rootView: PopoverView(fleet: fleet,
+                                  onShowPanel: { [weak self] in self?.revealPanel() },
+                                  onQuit: { NSApp.terminate(nil) }))
+
+        // Both are needed: an error with no sessions never reassigns `sessions`, so watching
+        // that alone would leave a stale count sitting in the menu bar.
+        fleet.$sessions
+            .sink { [weak self] sessions in
+                MainActor.assumeIsolated { self?.render(sessions: sessions) }
+            }
+            .store(in: &observers)
+        fleet.$lastError
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.render(sessions: self.fleet.sessions)
+                }
+            }
+            .store(in: &observers)
+
+        render(sessions: fleet.sessions)
+    }
+
+    // MARK: Readout
+
+    private func render(sessions: [Session]) {
+        guard let button = statusItem.button else { return }
+        if fleet.lastError != nil, sessions.isEmpty {
+            // A lying "0·0" would read as a quiet fleet. A dash reads as "no answer".
+            button.attributedTitle = NSAttributedString(
+                string: " —",
+                attributes: [.font: Self.numberFont(.regular)])
+            button.toolTip = fleet.lastError
+            return
+        }
+        button.attributedTitle = Self.readout(waiting: sessions.waitingCount,
+                                              working: sessions.workingCount)
+        button.toolTip = sessions.summaryLine
+    }
+
+    private static func numberFont(_ weight: NSFont.Weight) -> NSFont {
+        // Tabular digits: the item must not jitter as counts change width.
+        NSFont.monospacedDigitSystemFont(ofSize: 12, weight: weight)
+    }
+
+    /// Everything except amber deliberately carries NO colour attribute. Naming a colour here
+    /// is what breaks it: `labelColor` resolves against the app's appearance and came out black
+    /// while the template chevron beside it was tinted white by the menu bar. Left unset, the
+    /// text is drawn by the same machinery that tints the image, so the two always agree — in
+    /// dark menu bars, light ones, and under Reduce Transparency.
+    private static func readout(waiting: Int, working: Int) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        var amberAttributes: [NSAttributedString.Key: Any] = [.font: numberFont(.semibold)]
+        amberAttributes[.foregroundColor] = amber
+
+        out.append(NSAttributedString(
+            string: " \(waiting)",
+            attributes: waiting > 0 ? amberAttributes : [.font: numberFont(.regular)]))
+        out.append(NSAttributedString(
+            string: "·\(working)",
+            attributes: [.font: numberFont(.regular)]))
+        return out
+    }
+
+    // MARK: Interaction
+
+    @objc private func clicked() {
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
+            showMenu()
+        } else {
+            togglePopover()
+        }
+    }
+
+    private func togglePopover() {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+            return
+        }
+        popover.contentSize = PopoverMetrics.size(rows: fleet.sessions.count)
+        // An .accessory app must activate or the popover never takes key — and a popover that
+        // is not key never receives the click that is supposed to dismiss it.
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        let toggle = NSMenuItem(title: isPanelVisible() ? "Hide floating panel" : "Show floating panel",
+                                action: #selector(togglePanel), keyEquivalent: "")
+        toggle.target = self
+        menu.addItem(toggle)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit Ticker", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        // Handing the menu to the status item and clicking it is the only way to get the
+        // standard highlighted-menu behaviour; it is cleared again so left-click still opens
+        // the popover rather than the menu.
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    private func revealPanel() {
+        popover.performClose(nil)
+        onShowPanel()
+    }
+
+    @objc private func togglePanel() {
+        isPanelVisible() ? onHidePanel() : onShowPanel()
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+}
+
 // MARK: - App
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var panel: TickerPanel!
     let fleet = Fleet()
+    private var statusItemController: StatusItemController!
+    static let panelVisibleKey = "tickerPanelVisible"
+
+    private func showPanel() {
+        panel.orderFrontRegardless()
+        UserDefaults.standard.set(true, forKey: Self.panelVisibleKey)
+    }
+
+    private func hidePanel() {
+        panel.orderOut(nil)
+        UserDefaults.standard.set(false, forKey: Self.panelVisibleKey)
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon
@@ -1190,7 +1528,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         panel.setFrame(frame, display: false)
         expandedHeight = max(frame.height, 200)
-        panel.orderFrontRegardless()
+        // Hidden unless it was left open. bool(forKey:) is false when unset, so an existing
+        // install comes back with the panel put away and the menu bar item in its place.
+        if UserDefaults.standard.bool(forKey: Self.panelVisibleKey) {
+            panel.orderFrontRegardless()
+        }
+
+        NotificationCenter.default.addObserver(forName: .tickerHidePanel, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.hidePanel() }
+        }
 
         // Remember position and size, but never record the collapsed height as the real one.
         for note in [NSWindow.didMoveNotification, NSWindow.didEndLiveResizeNotification, .tickerDidResize] {
@@ -1218,6 +1564,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         collapseObserver = ui.$collapsed.sink { [weak self] value in
             MainActor.assumeIsolated { self?.applyCollapse(value) }
         }
+
+        // Last, so the panel exists for the callbacks to act on.
+        statusItemController = StatusItemController(
+            fleet: fleet,
+            isPanelVisible: { [weak self] in self?.panel.isVisible ?? false },
+            onShowPanel: { [weak self] in self?.showPanel() },
+            onHidePanel: { [weak self] in self?.hidePanel() })
     }
 
     private let ui = UIState()

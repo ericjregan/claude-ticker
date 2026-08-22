@@ -3,6 +3,7 @@
 Everything beyond installing it: what each row means, where the data comes from, what you
 can change, and the platform traps that shaped the implementation.
 
+- [Reading the menu bar](#reading-the-menu-bar)
 - [Reading the panel](#reading-the-panel)
 - [Design rules](#design-rules)
 - [Where the data comes from](#where-the-data-comes-from)
@@ -11,7 +12,23 @@ can change, and the platform traps that shaped the implementation.
 - [Troubleshooting](#troubleshooting)
 - [Things that are not obvious](#things-that-are-not-obvious)
 
+## Reading the menu bar
+
+The item is a double chevron followed by two numbers: **waiting · working**.
+
+| What you see | Means |
+|---|---|
+| `8·1` (amber 8) | Eight sessions want you, one is still generating. Amber appears only here. |
+| `0·2` | Nothing needs you; two sessions are working. |
+| `0·0` | A quiet fleet. The width never changes, so the item does not shift under the cursor. |
+| `—` | The scan failed. The popover carries the error; a `0·0` here would read as a quiet fleet and lie. |
+
+Click it for the list. Right-click it to show or hide the floating panel, or to quit.
+
 ## Reading the panel
+
+The panel is the same list in an always-on-top window, for when you want it permanently in
+view. It is hidden until you ask for it, and its ✕ hides it again rather than quitting.
 
 Each row is one session. Left to right: a status rail, the session name, chips, what the
 session wants from you, and its context usage.
@@ -85,12 +102,27 @@ One Swift file, three layers:
   conformance honest.
 - **`Fleet`** is the `@MainActor` view model. It schedules scans and publishes results. It
   performs no blocking work.
-- **`TickerView`** and friends render. Clicks are handled by `MouseView`, an `NSView`
-  subclass, not by SwiftUI gestures.
+- **`TickerView`**, **`PopoverView`** and friends render. Clicks are handled by `MouseView`,
+  an `NSView` subclass, not by SwiftUI gestures.
 
 This split matters. An earlier version ran the scan on the main actor, freezing the UI for
 roughly half a second every few seconds and making the whole panel feel broken. If you add
 work, add it inside `SessionScanner`, never in `Fleet`.
+
+Three smaller pieces sit alongside them:
+
+- **`TranscriptWatcher`** holds a `DispatchSource` per live transcript and triggers a scan when
+  one is appended to. This is what makes updates immediate; the poll timer is only a backstop
+  for sessions appearing and disappearing, which write nothing to an existing transcript.
+- **`TranscriptLocator`** answers "where is this session's transcript". The cwd slug is a guess,
+  not an answer — see [Things that are not obvious](#things-that-are-not-obvious).
+- **`StatusItemController`** owns the menu bar item and its popover. Two containers, one
+  `RowView`: the panel and the popover render the same rows.
+
+`PopoverView` and `TickerView` both take their headline numbers from the `summaryLine` /
+`waitingCount` / `workingCount` helpers on `[Session]`, so the three surfaces cannot drift.
+They hang off the array rather than `Fleet` on purpose: Combine delivers `@Published` values in
+`willSet`, so a subscriber reading `fleet.sessions` sees the *previous* list.
 
 ## Tuning it
 
@@ -98,11 +130,14 @@ All in `ClaudeTicker.swift`:
 
 | What | Where | Default |
 |---|---|---|
-| Poll interval | `Fleet.tickHandler` | 4s active, 10s idle |
+| Poll interval (backstop only) | `Fleet.tickHandler` | 4s active, 10s idle |
+| Transcript-write debounce | `TranscriptWatcher.init` | 0.35s |
+| Minimum gap between scans | `Fleet.transcriptChanged` | 1s |
 | Staleness threshold | `Session.isStale` | 48 hours |
 | Context warning color | `RowView.contextColor` | red at 85% |
 | Context window sizes | `ContextReader.millionTokenModels` | 1M for Claude 5 family |
-| Transcript re-read interval | `ContextReader.minimumRecomputeInterval` | 12s |
+| Menu bar mark weight | `MissionMark.strokeWidth` | 8 (brand file draws it at 10) |
+| Popover size | `PopoverMetrics` | 330pt wide, 470pt tall max |
 | Colors | `Palette` | — |
 
 Rebuild and restart with `./install.sh`.
@@ -123,8 +158,16 @@ because there is no window to raise.
 session. The panel substitutes the Terminal window's topic when it can find one. Naming
 sessions gives the best result.
 
-**Context shows nothing.** The transcript could not be located — most often a session whose
-cwd is a git worktree.
+**Context shows nothing.** The transcript could not be located. `TranscriptLocator` falls back
+to searching every project directory by session id, so this now means the file genuinely is not
+there — a session too new to have written one, or one whose transcript was deleted.
+
+**The menu bar item vanished but the app is running.** The panel's ✕ only hides the panel; the
+menu bar item is the app. If the item itself is missing, the menu bar is full and macOS has
+hidden it behind the notch — remove another item.
+
+**The floating panel will not come back.** Right-click the chevron → Show floating panel. Its
+visibility persists in `tickerPanelVisible`, and it starts hidden on a fresh install.
 
 ## Things that are not obvious
 
@@ -137,9 +180,22 @@ in the transcript — walking the JSONL backwards to the last `user`/`assistant`
 metadata records (`bridge-session`, `file-history-snapshot`, `permission-mode`, `pr-link`,
 `system`) that otherwise masquerade as the last message.
 
-**A transcript's mtime is not its last activity.** Something touches every `.jsonl`
-continuously; files modified "minutes ago" held messages days old. Use the last real message's
-timestamp.
+**A transcript's mtime is not its last activity.** Resuming or reopening a session rewrites the
+file, so `.jsonl`s modified "minutes ago" routinely hold messages days old. Use the last real
+message's timestamp. Freshness checks key on the file's *size* instead — transcripts are
+append-only, so an unchanged byte count proves the newest message is the one already parsed,
+and a stat costs microseconds.
+
+That said, transcripts are *quiet*: measured across an eleven-session fleet over ten seconds,
+ten of eleven files had identical size and mtime, and only the genuinely active one moved. That
+is what makes a `DispatchSource` watcher viable rather than a firehose.
+
+**A session's transcript is not under a slug of the cwd it reports.** It is under the cwd the
+session was *started* in. Sessions that moved, or were resumed from elsewhere, keep their
+original file — two of eleven live sessions, both git worktrees, resolved by slug alone to
+paths that did not exist, and so had never shown a context % or been able to report `your turn`.
+`TranscriptLocator` treats the slug as a fast guess and falls back to searching
+`~/.claude/projects/*/<sessionId>.jsonl`, caching both hits and misses.
 
 **Inside `tell application "Terminal"`, AppleScript's `tab` constant is shadowed** by
 Terminal's `tab` class and serializes as the literal text `"tab"`, silently breaking any
@@ -148,6 +204,21 @@ Terminal's `tab` class and serializes as the literal text `"tab"`, silently brea
 **SwiftUI tap gestures never fire in a borderless non-activating panel.** Clicks need an
 AppKit view overriding `acceptsFirstMouse`. The same limitation is why resizing uses an
 explicit corner grip rather than window edges.
+
+**`.resizable` gives the panel an OS resize corner even when the grip is hidden.** Collapsing
+hides the SwiftUI grip, but macOS still supplies its own — dragging it grew a collapsed panel
+into a tall empty box, since the rows, divider, `ctx` column and grip are all gated on
+`!collapsed`. A drag past the collapsed height now clears the flag. If a panel is ever blank
+below a correct header, suspect view state, not the scanner.
+
+**Never name a colour on the status item's title.** `labelColor` resolves against the *app's*
+appearance and renders black while the template image beside it is tinted white by the menu
+bar. Leave the foreground attribute unset and macOS draws the text with the same machinery that
+tints the image, so the two always agree. Amber is the one deliberate exception: it is a fixed
+sRGB value because it carries meaning, not theme.
+
+**A popover from an `.accessory` app must activate.** Without `NSApp.activate`, the popover
+never takes key, and a popover that is not key never receives the click meant to dismiss it.
 
 **`System Events … click at {x,y}` is an accessibility press, not a mouse event** — it will not
 exercise a real click handler. Test with a synthetic `CGEvent`.
