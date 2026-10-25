@@ -1414,12 +1414,14 @@ struct SessionList: View {
     }
 }
 
-/// The line between two Terminal windows. Same hairline as the one under the header.
+/// The line between two Terminal windows. Heavier and brighter than the hairline under the
+/// header so windows read as blocks at a glance, and neutral on purpose: amber is kept for
+/// sessions that want you.
 struct WindowDivider: View {
     var body: some View {
         Rectangle()
-            .fill(Palette.faint.opacity(0.28))
-            .frame(height: 0.5)
+            .fill(Palette.dim)
+            .frame(height: PopoverMetrics.dividerThickness)
             .padding(.vertical, PopoverMetrics.dividerPadding)
     }
 }
@@ -1665,8 +1667,9 @@ enum PopoverMetrics {
     static let header: CGFloat = 44
     static let footer: CGFloat = 31
     static let row: CGFloat = 30          // RowView is a fixed 30pt
-    static let dividerPadding: CGFloat = 3
-    static let divider: CGFloat = dividerPadding * 2 + 0.5
+    static let dividerPadding: CGFloat = 4
+    static let dividerThickness: CGFloat = 1.5
+    static let divider: CGFloat = dividerPadding * 2 + dividerThickness
     static let maxHeight: CGFloat = 470
 
     /// `capped: false` is for `--snapshot`, which renders the whole list at once.
