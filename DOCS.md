@@ -166,10 +166,26 @@ via AppleScript, which needs Automation permission for Terminal (System Settings
 Security → Automation). Sessions with no controlling terminal are filtered out precisely
 because there is no window to raise.
 
-**The list stopped grouping by window after a rebuild.** The binary is ad-hoc signed, and
-macOS ties the Accessibility grant to the exact binary. A rebuilt one stays listed as allowed
-but is no longer trusted, and the list falls back to flat with the "Allow Accessibility" line.
-Remove ClaudeTicker from the Accessibility list, add it again, and restart it.
+**The list stopped grouping by window after a rebuild.** An ad-hoc signed binary gets its
+Accessibility grant tied to that exact build. A rebuilt one stays listed as allowed but is no
+longer trusted, and the list falls back to flat with the "Allow Accessibility" line. Switch
+ClaudeTicker off and on again in the Accessibility list.
+
+To stop that happening, create a local signing identity once. `install.sh` signs with it
+whenever it exists, and the grant then survives rebuilds:
+
+```sh
+printf '%s\n' '[req]' 'distinguished_name = dn' 'x509_extensions = ext' 'prompt = no' \
+  '[dn]' 'CN = ClaudeTicker Local Signing' '[ext]' 'basicConstraints = critical,CA:false' \
+  'keyUsage = critical,digitalSignature' 'extendedKeyUsage = critical,codeSigning' > /tmp/ct.cnf
+openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/ct.key -out /tmp/ct.pem -days 3650 -config /tmp/ct.cnf
+openssl pkcs12 -export -inkey /tmp/ct.key -in /tmp/ct.pem -name "ClaudeTicker Local Signing" -out /tmp/ct.p12 -passout pass:temp
+security import /tmp/ct.p12 -k ~/Library/Keychains/login.keychain-db -P temp -T /usr/bin/codesign
+rm /tmp/ct.key /tmp/ct.p12
+```
+
+It shows as "not trusted" in `security find-identity`. That's expected for a self-made
+certificate and doesn't stop it signing.
 
 **Checking the list without opening it.** `./ClaudeTicker --snapshot out.png` runs one real
 scan, prints the rows grouped by window, and renders the drop-down to an image. It shows no

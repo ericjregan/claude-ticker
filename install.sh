@@ -16,6 +16,18 @@ command -v swiftc >/dev/null || {
 echo "Building..."
 swiftc -O -o "$BINARY" "$DIR/ClaudeTicker.swift"
 
+# Grouping tabs by window needs Accessibility. macOS ties that grant to the exact binary when
+# it's ad-hoc signed, so every rebuild loses it. Signed with a stable local identity, the
+# grant is to "this identifier, signed by this certificate" and survives rebuilds. Optional:
+# DOCS.md shows how to create the identity.
+SIGN_IDENTITY="ClaudeTicker Local Signing"
+SIGN_HASH=$(security find-identity -p codesigning 2>/dev/null \
+  | awk -v name="\"$SIGN_IDENTITY\"" 'index($0, name) { print $2; exit }')
+if [ -n "$SIGN_HASH" ]; then
+  codesign -f -s "$SIGN_HASH" --identifier "$LABEL" "$BINARY"
+  echo "Signed with $SIGN_IDENTITY."
+fi
+
 # Stop any previous copy so we never end up with two panels on screen.
 launchctl unload "$PLIST" 2>/dev/null || true
 pkill -f "$BINARY" 2>/dev/null || true
