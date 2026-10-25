@@ -59,6 +59,7 @@ struct Session: Identifiable {
     var isFocused: Bool = false   // the Terminal window you're currently in
     var contextPercent: Int?      // share of the model's context window in use
     var lastActivity: Double?     // epoch seconds; drives the stale (dimmed) treatment
+    var place: TabPlace?          // its Terminal window and tab; nil without Accessibility
 
     /// Only genuinely abandoned sessions fade out. Idle-but-recent stays fully legible —
     /// a session you touched an hour ago is still live work, whatever its status says.
@@ -68,6 +69,13 @@ struct Session: Identifiable {
         guard state == .idle, let t = lastActivity else { return false }
         return Date().timeIntervalSince1970 - t > 48 * 3600
     }
+}
+
+/// The rows of one Terminal window, in tab-bar order. A session with no window of its own
+/// (a background agent) is a section of one.
+struct SessionSection: Identifiable {
+    let id: String
+    let sessions: [Session]
 }
 
 /// Raw shape of `claude agents --json`.
@@ -380,6 +388,161 @@ final class TranscriptWatcher: @unchecked Sendable {
     }
 }
 
+// MARK: - Terminal windows and tabs
+//
+// Terminal's scripting interface can't see tab groups. macOS-native tabs are separate
+// windows, so a window holding five tabs scripts as five windows of one tab each. Only
+// Accessibility sees the tab bar: each real window's frame, and its tabs' titles left to
+// right. Every tab in a window shares that window's frame, so scripted tabs are matched to
+// tab-bar slots by frame, then by title. The title is what separates two windows that
+// happen to be parked at exactly the same spot, which really happens.
+
+/// Where a tab sits: which on-screen window, and its place in that window's tab bar.
+struct TabPlace: Sendable, Equatable {
+    let window: Int
+    let tab: Int
+}
+
+enum TerminalLayout {
+    /// One tab as Terminal's scripting reports it.
+    struct ScriptedTab {
+        let tty: String
+        let frame: CGRect?
+        let title: String         // the custom title Claude sets, e.g. "✳ Fix the login redirect"
+    }
+
+    /// One real window as Accessibility reports it.
+    struct Strip {
+        let frame: CGRect
+        let titles: [String]      // tab-bar order
+    }
+
+    /// Nil when Terminal didn't answer in full. A busy Terminal really does time out: one
+    /// read in six came back with no windows at all, which taken at face value says every
+    /// tab is alone in its own window. A partial answer is worse than none.
+    static func readStrips() -> [Strip]? {
+        guard let pid = terminalPID() else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        // Reads take 0.2–2 s while Terminal is busy drawing; past this, give up rather than
+        // hold the scan.
+        AXUIElementSetMessagingTimeout(app, 2.0)
+
+        guard let windows = elements(app, kAXWindowsAttribute) else { return nil }
+        var strips: [Strip] = []
+        for window in windows {
+            guard let frame = frame(of: window),
+                  let children = elements(window, kAXChildrenAttribute) else { return nil }
+            var titles: [String] = []
+            if let bar = children.first(where: { string(of: $0, kAXRoleAttribute) == kAXTabGroupRole }) {
+                guard let tabs = elements(bar, kAXChildrenAttribute) else { return nil }
+                titles = tabs.filter { string(of: $0, kAXRoleAttribute) == kAXRadioButtonRole }
+                    .compactMap { string(of: $0, kAXTitleAttribute) }
+            }
+            // No tab bar means a window of one tab, whose title is the window's own.
+            strips.append(Strip(frame: frame,
+                                titles: titles.isEmpty ? [string(of: window, kAXTitleAttribute) ?? ""] : titles))
+        }
+        return strips
+    }
+
+    /// tty -> place, filled in three passes, each across every window before the next:
+    /// frame and title; then title alone, because a hidden tab can report its window's old
+    /// frame for a while after the window moves; then frame alone, for a tab whose title
+    /// changed between the two reads. Tabs still left over each get a window of their own.
+    static func places(tabs: [ScriptedTab], strips: [Strip]) -> [String: TabPlace] {
+        var slots = strips.map { [String?](repeating: nil, count: $0.titles.count) }
+        var unplaced = tabs
+
+        func fill(_ fits: (ScriptedTab, Strip, String) -> Bool) {
+            for (w, strip) in strips.enumerated() {
+                for (i, title) in strip.titles.enumerated() where slots[w][i] == nil {
+                    if let j = unplaced.firstIndex(where: { fits($0, strip, title) }) {
+                        slots[w][i] = unplaced.remove(at: j).tty
+                    }
+                }
+            }
+        }
+        fill { tab, strip, title in sameFrame(tab.frame, strip.frame) && matches(title, tab.title) }
+        fill { tab, _, title in matches(title, tab.title) }
+        fill { tab, strip, _ in sameFrame(tab.frame, strip.frame) }
+
+        var result: [String: TabPlace] = [:]
+        for (w, column) in slots.enumerated() {
+            for (i, tty) in column.enumerated() {
+                if let tty { result[tty] = TabPlace(window: w, tab: i) }
+            }
+        }
+        for (k, tab) in unplaced.enumerated() {
+            result[tab.tty] = TabPlace(window: strips.count + k, tab: 0)
+        }
+        return result
+    }
+
+    /// A tab-bar title names a tab when it is that tab's title, or contains it as one of
+    /// the " — " parts Terminal joins onto it ("~ — ✳ Fix the login redirect — node ◂ claude").
+    static func matches(_ barTitle: String, _ tabTitle: String) -> Bool {
+        let wanted = bare(tabTitle)
+        guard !wanted.isEmpty else { return false }
+        return bare(barTitle) == wanted
+            || barTitle.components(separatedBy: " — ").contains { bare($0) == wanted }
+    }
+
+    /// Drops the status glyph Claude animates at the front of its title (✳, ◐, ⠂ …).
+    static func bare(_ s: String) -> String {
+        var t = s.trimmingCharacters(in: .whitespaces)
+        while let f = t.first, !f.isLetter, !f.isNumber {
+            t.removeFirst()
+            t = t.trimmingCharacters(in: .whitespaces)
+        }
+        return t
+    }
+
+    /// Found from the process table, not NSRunningApplication: that list is filled in by
+    /// the run loop and came back empty for 7 reads in 20 here.
+    private static func terminalPID() -> pid_t? {
+        let capacity = Int(proc_listallpids(nil, 0)) + 64
+        var pids = [pid_t](repeating: 0, count: capacity)
+        let found = Int(proc_listallpids(&pids, Int32(capacity * MemoryLayout<pid_t>.size)))
+        var path = [CChar](repeating: 0, count: 4096)   // PROC_PIDPATHINFO_MAXSIZE
+        for pid in pids.prefix(max(found, 0)) where pid > 0 {
+            guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { continue }
+            if String(cString: path).hasSuffix("/Terminal.app/Contents/MacOS/Terminal") { return pid }
+        }
+        return nil
+    }
+
+    private static func sameFrame(_ a: CGRect?, _ b: CGRect) -> Bool {
+        guard let a else { return false }
+        return abs(a.minX - b.minX) <= 1 && abs(a.minY - b.minY) <= 1
+            && abs(a.width - b.width) <= 1 && abs(a.height - b.height) <= 1
+    }
+
+    private static func elements(_ e: AXUIElement, _ attribute: String) -> [AXUIElement]? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(e, attribute as CFString, &value) == .success else { return nil }
+        return (value as? [AXUIElement]) ?? []
+    }
+
+    private static func string(of e: AXUIElement, _ attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(e, attribute as CFString, &value) == .success else { return nil }
+        return value as? String
+    }
+
+    private static func frame(of e: AXUIElement) -> CGRect? {
+        var pos: CFTypeRef?, size: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(e, kAXPositionAttribute as CFString, &pos) == .success,
+              AXUIElementCopyAttributeValue(e, kAXSizeAttribute as CFString, &size) == .success,
+              let pos, let size,
+              CFGetTypeID(pos) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID()
+        else { return nil }
+        var origin = CGPoint.zero, extent = CGSize.zero
+        guard AXValueGetValue(pos as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(size as! AXValue, .cgSize, &extent) else { return nil }
+        return CGRect(origin: origin, size: extent)
+    }
+}
+
 // MARK: - Scanning
 //
 // Every blocking call lives here: `claude agents --json` alone costs ~300ms, plus osascript,
@@ -390,7 +553,13 @@ final class TranscriptWatcher: @unchecked Sendable {
 final class SessionScanner: @unchecked Sendable {
     struct Result: Sendable {
         let sessions: [Session]
+        let sections: [SessionSection]
+        let grouped: Bool         // false = no Accessibility, so the list can't be grouped
         let error: String?
+
+        static func failed(_ error: String) -> Result {
+            Result(sessions: [], sections: [], grouped: true, error: error)
+        }
     }
 
     private let queue = DispatchQueue(label: "com.claude-ticker.scan", qos: .userInitiated)
@@ -400,6 +569,8 @@ final class SessionScanner: @unchecked Sendable {
     private var ttyCache: [Int: String] = [:]
     private var titleByTTY: [String: String] = [:]
     private var focusedTTY: String?
+    private var placeByTTY: [String: TabPlace]?   // nil until the first full read of the tab bars
+    private var canSeeTabs = true                 // Accessibility granted; false shows the hint
     private var sinceTerminalPoll = 99
     private var dismissed: [String: Double]
 
@@ -455,7 +626,7 @@ final class SessionScanner: @unchecked Sendable {
             resolvedClaude = true
         }
         guard let claude = claudePath else {
-            return Result(sessions: [], error: "claude not found on PATH")
+            return .failed("claude not found on PATH")
         }
 
         sinceTerminalPoll += 1
@@ -467,7 +638,7 @@ final class SessionScanner: @unchecked Sendable {
         guard let out = Self.run(claude, ["agents", "--json"]),
               let data = out.data(using: .utf8),
               let raw = try? JSONDecoder().decode([RawSession].self, from: data) else {
-            return Result(sessions: [], error: "couldn't read sessions")
+            return .failed("couldn't read sessions")
         }
 
         let mapped: [Session] = raw.compactMap { r -> Session? in
@@ -538,21 +709,46 @@ final class SessionScanner: @unchecked Sendable {
             )
         }
 
-        var all = mapped + scanCodex()
-        if let front = focusedTTY {
-            all = all.map { s in
-                var copy = s
-                copy.isFocused = s.pid.flatMap { self.tty(for: $0) } == front
-                return copy
-            }
+        var all = (mapped + scanCodex()).map { s in
+            var copy = s
+            let dev = s.pid.flatMap { self.tty(for: $0) }
+            if let front = focusedTTY { copy.isFocused = dev == front }
+            copy.place = dev.flatMap { placeByTTY?[$0] }
+            return copy
         }
         all.sort {
             let a = Self.rank($0), b = Self.rank($1)
             if a != b { return a < b }
             return ($0.lastActivity ?? $0.startedAt / 1000) > ($1.lastActivity ?? $1.startedAt / 1000)
         }
-        return Result(sessions: all, error: nil)
+        let sections = Self.sections(all, grouped: placeByTTY != nil)
+        return Result(sessions: sections.flatMap(\.sessions), sections: sections,
+                      grouped: canSeeTabs, error: nil)
     }
+
+    /// One section per Terminal window, its tabs in tab-bar order. A window sits where its
+    /// most urgent tab would have sorted, so anything that wants you still floats to the
+    /// top, with its window around it. Without Accessibility there are no windows to group
+    /// by, and the list is one section in plain priority order.
+    private static func sections(_ sorted: [Session], grouped: Bool) -> [SessionSection] {
+        guard grouped else {
+            return sorted.isEmpty ? [] : [SessionSection(id: "all", sessions: sorted)]
+        }
+        var order: [String] = []
+        var members: [String: [Session]] = [:]
+        for s in sorted {
+            let key = s.place.map { "window-\($0.window)" } ?? "session-\(s.id)"
+            if members[key] == nil { order.append(key) }
+            members[key, default: []].append(s)
+        }
+        return order.map { key in
+            let tabs = members[key, default: []].sorted { ($0.place?.tab ?? 0) < ($1.place?.tab ?? 0) }
+            return SessionSection(id: tabs.first?.id ?? key, sessions: tabs)
+        }
+    }
+
+    /// Synchronous scan for `--snapshot`, which has no run loop to call back on.
+    func scanNow() -> Result { queue.sync { performScan() } }
 
     /// Priority ladder. Amber stays above the focused window on purpose: a blocked session
     /// is an interrupt you haven't cleared, and you can already see the window you're in.
@@ -659,10 +855,15 @@ final class SessionScanner: @unchecked Sendable {
             set out to "FRONT" & d & (tty of tab 1 of front window) & linefeed
           end try
           repeat with w in windows
+            set f to ""
+            try
+              set b to bounds of w
+              set f to ((item 1 of b) as text) & "," & ((item 2 of b) as text) & "," & ((item 3 of b) as text) & "," & ((item 4 of b) as text)
+            end try
             try
               repeat with t in tabs of w
                 try
-                  set out to out & (tty of t) & d & (name of w) & linefeed
+                  set out to out & (tty of t) & d & (name of w) & d & f & d & (custom title of t) & linefeed
                 end try
               end repeat
             end try
@@ -672,16 +873,38 @@ final class SessionScanner: @unchecked Sendable {
         """
         guard let out = Self.run("/usr/bin/osascript", ["-e", script]) else { return }
         var map: [String: String] = [:]
+        var tabs: [TerminalLayout.ScriptedTab] = []
         for line in out.split(separator: "\n") {
             let parts = line.components(separatedBy: "\t")
             guard parts.count >= 2 else { continue }
             if parts[0] == "FRONT" {
                 focusedTTY = parts[1]
-            } else if let topic = Self.topic(fromWindowTitle: parts[1]) {
+                continue
+            }
+            if let topic = Self.topic(fromWindowTitle: parts[1]) {
                 map[parts[0]] = topic
+            }
+            if parts.count >= 4 {
+                tabs.append(.init(tty: parts[0], frame: Self.frame(fromBounds: parts[2]), title: parts[3]))
             }
         }
         titleByTTY = map
+        canSeeTabs = AXIsProcessTrusted()
+        if !canSeeTabs {
+            placeByTTY = nil
+        } else if let strips = TerminalLayout.readStrips() {
+            placeByTTY = TerminalLayout.places(tabs: tabs, strips: strips)
+        }
+        // Otherwise Terminal didn't answer in time: keep the last layout, which is right far
+        // more often than splitting every window apart until the next read.
+    }
+
+    /// AppleScript bounds are "left,top,right,bottom" in the same top-left-origin screen
+    /// coordinates Accessibility uses.
+    private static func frame(fromBounds s: String) -> CGRect? {
+        let n = s.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        guard n.count == 4 else { return nil }
+        return CGRect(x: n[0], y: n[1], width: n[2] - n[0], height: n[3] - n[1])
     }
 
     /// "myproject — ⠂ Fix the login redirect — caffeinate ◂ claude — 97×23" -> "Fix the login redirect"
@@ -727,6 +950,8 @@ final class SessionScanner: @unchecked Sendable {
 @MainActor
 final class Fleet: ObservableObject {
     @Published var sessions: [Session] = []
+    @Published var sections: [SessionSection] = []
+    @Published var grouped = true    // false = Accessibility not granted; say so, don't guess
     @Published var lastError: String?
 
     private let scanner = SessionScanner()
@@ -773,6 +998,9 @@ final class Fleet: ObservableObject {
         }
     }
 
+    /// One blocking scan, for `--snapshot`.
+    func scanNow() { apply(scanner.scanNow()) }
+
     func focus(_ session: Session) {
         guard let pid = session.pid else { return }
         scanner.focus(pid: pid)
@@ -784,10 +1012,14 @@ final class Fleet: ObservableObject {
         }
     }
 
-    private func apply(_ result: SessionScanner.Result) {
+    func apply(_ result: SessionScanner.Result) {
         scanning = false
         lastError = result.error
-        if result.error == nil || !result.sessions.isEmpty { sessions = result.sessions }
+        if result.error == nil || !result.sessions.isEmpty {
+            sessions = result.sessions
+            sections = result.sections
+            grouped = result.grouped
+        }
         // Follow the fleet: sessions that ended stop being watched, new ones start.
         watcher?.watch(paths: sessions.compactMap { session in
             // Codex rows own no transcript — no session id, no cwd. Asking the locator about
@@ -1081,6 +1313,58 @@ struct RowView: View {
     }
 }
 
+/// The rows, one block per Terminal window with its tabs in tab-bar order. The panel and the
+/// drop-down both draw this, so the two lists can't drift apart.
+struct SessionList: View {
+    @ObservedObject var fleet: Fleet
+
+    var body: some View {
+        ScrollView {
+            // Not lazy: a few dozen rows at most, and a lazy stack left rows undrawn.
+            VStack(spacing: 0) {
+                ForEach(Array(fleet.sections.enumerated()), id: \.element.id) { index, section in
+                    if index > 0 { WindowDivider() }
+                    ForEach(section.sessions) { s in
+                        RowView(session: s, onTap: { fleet.focus(s) }, onMarkRead: { fleet.markRead(s) })
+                    }
+                }
+                if !fleet.grouped { AccessibilityHint() }
+            }
+        }
+    }
+}
+
+/// The line between two Terminal windows. Same hairline as the one under the header.
+struct WindowDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(Palette.faint.opacity(0.28))
+            .frame(height: 0.5)
+            .padding(.vertical, PopoverMetrics.dividerPadding)
+    }
+}
+
+/// Grouping needs Accessibility, and a rebuilt binary silently loses the grant. Say so in
+/// the list rather than quietly showing it flat, and make the fix one click away.
+struct AccessibilityHint: View {
+    @State private var hovering = false
+
+    var body: some View {
+        Text("Allow Accessibility to group tabs by window")
+            .font(.system(size: 10.5))
+            .foregroundColor(hovering ? Palette.ink : Palette.dim)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .frame(height: PopoverMetrics.row)
+            .overlay(MouseArea(onClick: {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                    NSWorkspace.shared.open(url)
+                }
+            }, onHover: { hovering = $0 }))
+    }
+}
+
 /// Chrome state that lives outside the session data.
 @MainActor
 final class UIState: ObservableObject {
@@ -1155,14 +1439,8 @@ struct TickerView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(12)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(fleet.sessions) { s in
-                            RowView(session: s, onTap: { fleet.focus(s) }, onMarkRead: { fleet.markRead(s) })
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                SessionList(fleet: fleet)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }
@@ -1283,16 +1561,8 @@ struct PopoverView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(12)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(fleet.sessions) { s in
-                            RowView(session: s,
-                                    onTap: { fleet.focus(s) },
-                                    onMarkRead: { fleet.markRead(s) })
-                        }
-                    }
-                }
-                .frame(maxHeight: .infinity)
+                SessionList(fleet: fleet)
+                    .frame(maxHeight: .infinity)
             }
 
             Rectangle().fill(Palette.faint.opacity(0.28)).frame(height: 0.5)
@@ -1315,11 +1585,17 @@ enum PopoverMetrics {
     static let header: CGFloat = 44
     static let footer: CGFloat = 31
     static let row: CGFloat = 30          // RowView is a fixed 30pt
+    static let dividerPadding: CGFloat = 3
+    static let divider: CGFloat = dividerPadding * 2 + 0.5
     static let maxHeight: CGFloat = 470
 
-    static func size(rows: Int) -> NSSize {
-        let body = CGFloat(max(rows, 1)) * row
-        return NSSize(width: width, height: min(header + body + footer, maxHeight))
+    /// `capped: false` is for `--snapshot`, which renders the whole list at once.
+    @MainActor
+    static func size(for fleet: Fleet, capped: Bool = true) -> NSSize {
+        let rows = fleet.sessions.count + (fleet.grouped ? 0 : 1)
+        let body = CGFloat(max(rows, 1)) * row + CGFloat(max(fleet.sections.count - 1, 0)) * divider
+        let height = header + body + footer
+        return NSSize(width: width, height: capped ? min(height, maxHeight) : height)
     }
 }
 
@@ -1473,7 +1749,7 @@ final class StatusItemController {
             popover.performClose(nil)
             return
         }
-        popover.contentSize = PopoverMetrics.size(rows: fleet.sessions.count)
+        popover.contentSize = PopoverMetrics.size(for: fleet)
         // An .accessory app must activate or the popover never takes key — and a popover that
         // is not key never receives the click that is supposed to dismiss it.
         NSApp.activate(ignoringOtherApps: true)
@@ -1534,6 +1810,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon
+        // Grouping tabs by window reads Terminal's tab bars, which takes Accessibility. macOS
+        // shows its own prompt only if the app isn't listed yet; the list's hint covers the
+        // case of a rebuilt binary that is listed but no longer trusted.
+        _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         fleet.start()
 
         // No preferredContentSize: the user's chosen size wins, and the list scrolls inside it.
@@ -1650,7 +1930,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - Snapshot
+//
+// `ClaudeTicker --snapshot out.png` renders the drop-down from one real scan into an image,
+// and prints its rows grouped by window. No window is shown and the menu bar is untouched,
+// so the UI can be checked without taking over the screen of whoever is working at this Mac.
+
+@MainActor
+enum Snapshot {
+    static func write(to path: String) {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        let fleet = Fleet()
+        fleet.scanNow()
+        for section in fleet.sections {
+            print("--")
+            for s in section.sessions {
+                let place = s.place.map { "window \($0.window) tab \($0.tab)" } ?? "no window"
+                print("  \(s.name)  [\(place)]  \(s.state.label)")
+            }
+        }
+        if !fleet.grouped { print("(not grouped: no Accessibility)") }
+
+        let size = PopoverMetrics.size(for: fleet, capped: false)
+        let host = NSHostingView(rootView: PopoverView(fleet: fleet, onShowPanel: {}, onQuit: {})
+            .frame(width: size.width, height: size.height))
+        host.appearance = NSAppearance(named: .darkAqua)
+        host.frame = NSRect(origin: .zero, size: size)
+        // Never ordered in: it exists only so the view has somewhere to lay out.
+        let window = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+        host.cacheDisplay(in: host.bounds, to: rep)
+        do {
+            try rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+        } catch {
+            FileHandle.standardError.write("snapshot: \(error)\n".data(using: .utf8) ?? Data())
+        }
+    }
+}
+
 MainActor.assumeIsolated {
+    let args = CommandLine.arguments
+    if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
+        Snapshot.write(to: args[i + 1])
+        exit(0)
+    }
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate

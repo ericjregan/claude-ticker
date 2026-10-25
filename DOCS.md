@@ -51,8 +51,17 @@ session wants from you, and its context usage.
 Click a row to raise its Terminal window. Drag the header to move the panel, the corner grip
 to resize it, and the chevron to collapse it to a header bar.
 
-Rows sort by priority, then by most recently touched: amber states → the window you are in →
-failed → working → everything else.
+Rows are grouped by Terminal window, with a hairline between windows, and each window's tabs
+appear in the same left-to-right order as its tab bar. A window sits where its most urgent tab
+would sort, so anything that wants you still floats to the top: amber states → the window you
+are in → failed → working → everything else, then most recently touched.
+
+Grouping needs Accessibility permission (System Settings → Privacy & Security →
+Accessibility). Terminal's AppleScript cannot see tab groups, because macOS-native tabs are
+separate windows: a window with five tabs scripts as five windows. Only Accessibility exposes
+the tab bar. The app asks for the permission at launch. Without it, the list is one flat
+priority-ordered list ending in an "Allow Accessibility to group tabs by window" line, which
+opens the right settings pane.
 
 ## Design rules
 
@@ -156,6 +165,15 @@ inherit your shell PATH.
 via AppleScript, which needs Automation permission for Terminal (System Settings → Privacy &
 Security → Automation). Sessions with no controlling terminal are filtered out precisely
 because there is no window to raise.
+
+**The list stopped grouping by window after a rebuild.** The binary is ad-hoc signed, and
+macOS ties the Accessibility grant to the exact binary. A rebuilt one stays listed as allowed
+but is no longer trusted, and the list falls back to flat with the "Allow Accessibility" line.
+Remove ClaudeTicker from the Accessibility list, add it again, and restart it.
+
+**Checking the list without opening it.** `./ClaudeTicker --snapshot out.png` runs one real
+scan, prints the rows grouped by window, and renders the drop-down to an image. It shows no
+window and leaves the menu bar alone.
 
 **Session names look like `myproject-3f`.** That is Claude's throwaway name for an unnamed
 session. The panel substitutes the Terminal window's topic when it can find one. Naming
