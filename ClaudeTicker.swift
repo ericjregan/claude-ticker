@@ -61,6 +61,11 @@ struct Session: Identifiable {
     var lastActivity: Double?     // epoch seconds; drives the stale (dimmed) treatment
     var place: TabPlace?          // its Terminal window and tab; nil without Accessibility
 
+    /// `id` is the session id, and one session can be listed twice: a background agent
+    /// blocked on a prompt alongside the Terminal tab it came from. SwiftUI needs a key per
+    /// row, or the second row silently draws the first one's content.
+    var rowID: String { "\(tag ?? "tab")-\(id)-\(pid.map(String.init) ?? "")" }
+
     /// Only genuinely abandoned sessions fade out. Idle-but-recent stays fully legible —
     /// a session you touched an hour ago is still live work, whatever its status says.
     /// Anything currently running or blocked on you is never abandoned by definition,
@@ -737,13 +742,13 @@ final class SessionScanner: @unchecked Sendable {
         var order: [String] = []
         var members: [String: [Session]] = [:]
         for s in sorted {
-            let key = s.place.map { "window-\($0.window)" } ?? "session-\(s.id)"
+            let key = s.place.map { "window-\($0.window)" } ?? "row-\(s.rowID)"
             if members[key] == nil { order.append(key) }
             members[key, default: []].append(s)
         }
         return order.map { key in
             let tabs = members[key, default: []].sorted { ($0.place?.tab ?? 0) < ($1.place?.tab ?? 0) }
-            return SessionSection(id: tabs.first?.id ?? key, sessions: tabs)
+            return SessionSection(id: tabs.first?.rowID ?? key, sessions: tabs)
         }
     }
 
@@ -1324,7 +1329,7 @@ struct SessionList: View {
             VStack(spacing: 0) {
                 ForEach(Array(fleet.sections.enumerated()), id: \.element.id) { index, section in
                     if index > 0 { WindowDivider() }
-                    ForEach(section.sessions) { s in
+                    ForEach(section.sessions, id: \.rowID) { s in
                         RowView(session: s, onTap: { fleet.focus(s) }, onMarkRead: { fleet.markRead(s) })
                     }
                 }
