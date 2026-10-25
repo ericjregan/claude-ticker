@@ -428,9 +428,10 @@ enum TerminalLayout {
     static func readStrips() -> [Strip]? {
         guard let pid = terminalPID() else { return nil }
         let app = AXUIElementCreateApplication(pid)
-        // Reads take 0.2–2 s while Terminal is busy drawing; past this, give up rather than
-        // hold the scan.
-        AXUIElementSetMessagingTimeout(app, 2.0)
+        // Reads take 0.2–2 s while Terminal is busy drawing; past this, give up. Set on the
+        // system-wide element, because a timeout set on `app` doesn't reach the windows and
+        // tabs read through it.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 2.0)
 
         guard let windows = elements(app, kAXWindowsAttribute) else { return nil }
         var strips: [Strip] = []
@@ -450,26 +451,54 @@ enum TerminalLayout {
         return strips
     }
 
-    /// tty -> place, filled in three passes, each across every window before the next:
-    /// frame and title; then title alone, because a hidden tab can report its window's old
-    /// frame for a while after the window moves; then frame alone, for a tab whose title
-    /// changed between the two reads. Tabs still left over each get a window of their own.
+    /// tty -> place, filled in three passes: frame and title; then title alone, because a
+    /// hidden tab can report its window's old frame for a while after the window moves;
+    /// then frame alone, for tabs with a blank title. No pass guesses. When two tabs could
+    /// fill a slot (two sessions with the same name, say) neither is placed, and each shows
+    /// as a window of its own: better than putting a session in a window it isn't in.
     static func places(tabs: [ScriptedTab], strips: [Strip]) -> [String: TabPlace] {
         var slots = strips.map { [String?](repeating: nil, count: $0.titles.count) }
         var unplaced = tabs
 
-        func fill(_ fits: (ScriptedTab, Strip, String) -> Bool) {
-            for (w, strip) in strips.enumerated() {
-                for (i, title) in strip.titles.enumerated() where slots[w][i] == nil {
-                    if let j = unplaced.firstIndex(where: { fits($0, strip, title) }) {
-                        slots[w][i] = unplaced.remove(at: j).tty
+        // A slot is filled only when it has exactly one candidate and that candidate fits
+        // no other open slot. Each placement can settle another pair, so repeat until stable.
+        func fillUnambiguous(_ fits: (ScriptedTab, Strip, String) -> Bool) {
+            var placedAny = true
+            while placedAny {
+                placedAny = false
+                var open: [(w: Int, i: Int, candidates: [Int])] = []
+                for (w, strip) in strips.enumerated() {
+                    for (i, title) in strip.titles.enumerated() where slots[w][i] == nil {
+                        open.append((w, i, unplaced.indices.filter { fits(unplaced[$0], strip, title) }))
                     }
+                }
+                var claims: [Int: Int] = [:]
+                for slot in open { for j in slot.candidates { claims[j, default: 0] += 1 } }
+                let sure = open.filter { $0.candidates.count == 1 && claims[$0.candidates[0]] == 1 }
+                // Highest index first, so each removal leaves the pending indices valid.
+                for slot in sure.sorted(by: { $0.candidates[0] > $1.candidates[0] }) {
+                    slots[slot.w][slot.i] = unplaced.remove(at: slot.candidates[0]).tty
+                    placedAny = true
                 }
             }
         }
-        fill { tab, strip, title in sameFrame(tab.frame, strip.frame) && matches(title, tab.title) }
-        fill { tab, _, title in matches(title, tab.title) }
-        fill { tab, strip, _ in sameFrame(tab.frame, strip.frame) }
+        fillUnambiguous { tab, strip, title in sameFrame(tab.frame, strip.frame) && matches(title, tab.title) }
+        fillUnambiguous { tab, _, title in matches(title, tab.title) }
+
+        // Frame alone settles which window, though not the order among untitled tabs, and
+        // only when no other window with an open slot sits at the same spot.
+        for (w, strip) in strips.enumerated() {
+            let open = slots[w].indices.filter { slots[w][$0] == nil }
+            guard !open.isEmpty else { continue }
+            let rival = strips.indices.contains {
+                $0 != w && sameFrame(strips[$0].frame, strip.frame) && slots[$0].contains(nil)
+            }
+            let here = unplaced.indices.filter { sameFrame(unplaced[$0].frame, strip.frame) }
+            guard !rival, here.count <= open.count else { continue }
+            for (slot, j) in zip(open, here).reversed() {
+                slots[w][slot] = unplaced.remove(at: j).tty
+            }
+        }
 
         var result: [String: TabPlace] = [:]
         for (w, column) in slots.enumerated() {
@@ -553,7 +582,9 @@ enum TerminalLayout {
 // Every blocking call lives here: `claude agents --json` alone costs ~300ms, plus osascript,
 // ps, and transcript reads. Run on the main thread that froze the UI for roughly half a
 // second at a time, which is what made the panel feel unlike a native window. All of it now
-// runs on one serial queue — that confinement is what makes @unchecked Sendable honest.
+// runs on one serial queue, except the Terminal read, which has its own queue so a click
+// never waits behind it and hands its result over under a lock. That confinement is what
+// makes @unchecked Sendable honest.
 
 final class SessionScanner: @unchecked Sendable {
     struct Result: Sendable {
@@ -572,11 +603,22 @@ final class SessionScanner: @unchecked Sendable {
     private var claudePath: String?
     private var resolvedClaude = false
     private var ttyCache: [Int: String] = [:]
-    private var titleByTTY: [String: String] = [:]
-    private var focusedTTY: String?
-    private var placeByTTY: [String: TabPlace]?   // nil until the first full read of the tab bars
-    private var canSeeTabs = true                 // Accessibility granted; false shows the hint
     private var sinceTerminalPoll = 99
+
+    /// What Terminal last reported. Read on a queue of its own: AppleScript plus the tab bars
+    /// take 0.5–3 s while Terminal is busy, and clicking a row must never wait behind that.
+    /// The two fields below are the only scanner state touched off `queue`, hence the lock.
+    struct TerminalState {
+        var titleByTTY: [String: String] = [:]
+        var focusedTTY: String?
+        var placeByTTY: [String: TabPlace]?   // nil until the first full read of the tab bars
+        var canSeeTabs = true                 // Accessibility granted; false shows the hint
+        var loaded = false
+    }
+    private let terminalQueue = DispatchQueue(label: "com.claude-ticker.terminal", qos: .utility)
+    private let terminalLock = NSLock()
+    private var terminalState = TerminalState()   // guarded by terminalLock
+    private var terminalReading = false           // guarded by terminalLock
     private var dismissed: [String: Double]
 
     init() {
@@ -637,8 +679,9 @@ final class SessionScanner: @unchecked Sendable {
         sinceTerminalPoll += 1
         if sinceTerminalPoll >= 2 {
             sinceTerminalPoll = 0
-            refreshTerminalState()
+            refreshTerminal(wait: !latestTerminal.loaded)
         }
+        let terminal = latestTerminal
 
         guard let out = Self.run(claude, ["agents", "--json"]),
               let data = out.data(using: .utf8),
@@ -691,7 +734,7 @@ final class SessionScanner: @unchecked Sendable {
             var displayName = r.name ?? "untitled"
             if Self.isAutoName(displayName, cwd: r.cwd ?? ""),
                let pid = r.pid, let dev = tty(for: pid),
-               let topic = titleByTTY[dev] {
+               let topic = terminal.titleByTTY[dev] {
                 displayName = topic
             }
 
@@ -714,11 +757,11 @@ final class SessionScanner: @unchecked Sendable {
             )
         }
 
-        var all = (mapped + scanCodex()).map { s in
+        var all = (mapped + scanCodex(titleByTTY: terminal.titleByTTY)).map { s in
             var copy = s
             let dev = s.pid.flatMap { self.tty(for: $0) }
-            if let front = focusedTTY { copy.isFocused = dev == front }
-            copy.place = dev.flatMap { placeByTTY?[$0] }
+            if let front = terminal.focusedTTY { copy.isFocused = dev == front }
+            copy.place = dev.flatMap { terminal.placeByTTY?[$0] }
             return copy
         }
         all.sort {
@@ -726,9 +769,9 @@ final class SessionScanner: @unchecked Sendable {
             if a != b { return a < b }
             return ($0.lastActivity ?? $0.startedAt / 1000) > ($1.lastActivity ?? $1.startedAt / 1000)
         }
-        let sections = Self.sections(all, grouped: placeByTTY != nil)
+        let sections = Self.sections(all, grouped: terminal.placeByTTY != nil)
         return Result(sessions: sections.flatMap(\.sessions), sections: sections,
-                      grouped: canSeeTabs, error: nil)
+                      grouped: terminal.canSeeTabs, error: nil)
     }
 
     /// One section per Terminal window, its tabs in tab-bar order. A window sits where its
@@ -802,7 +845,7 @@ final class SessionScanner: @unchecked Sendable {
         "completion", "apply", "--version", "--help", "-V", "-h"
     ]
 
-    private func scanCodex() -> [Session] {
+    private func scanCodex(titleByTTY: [String: String]) -> [Session] {
         guard let out = Self.run("/bin/ps", ["-eo", "pid=,tty=,pcpu=,args="]) else { return [] }
 
         return out.split(separator: "\n").compactMap { line -> Session? in
@@ -851,7 +894,36 @@ final class SessionScanner: @unchecked Sendable {
     /// NOTE: the delimiter is `ASCII character 9`, never the `tab` constant — inside a
     /// `tell application "Terminal"` block `tab` resolves to Terminal's tab *class* and
     /// silently serializes as the literal text "tab".
-    private func refreshTerminalState() {
+    private var latestTerminal: TerminalState {
+        terminalLock.lock()
+        defer { terminalLock.unlock() }
+        return terminalState
+    }
+
+    /// Starts a Terminal read unless one is already running. Only the first scan waits for
+    /// it, so the list never opens without names; after that a scan uses the latest read.
+    private func refreshTerminal(wait: Bool) {
+        terminalLock.lock()
+        let busy = terminalReading
+        if !busy { terminalReading = true }
+        let previous = terminalState
+        terminalLock.unlock()
+
+        guard !busy else {
+            if wait { terminalQueue.sync {} }   // let the read already under way land
+            return
+        }
+        let read = {
+            let next = Self.readTerminal(previous: previous)
+            self.terminalLock.lock()
+            self.terminalState = next
+            self.terminalReading = false
+            self.terminalLock.unlock()
+        }
+        if wait { terminalQueue.sync(execute: read) } else { terminalQueue.async(execute: read) }
+    }
+
+    private static func readTerminal(previous: TerminalState) -> TerminalState {
         let script = """
         set d to ASCII character 9
         tell application "Terminal"
@@ -876,14 +948,15 @@ final class SessionScanner: @unchecked Sendable {
           return out
         end tell
         """
-        guard let out = Self.run("/usr/bin/osascript", ["-e", script]) else { return }
+        guard let out = Self.run("/usr/bin/osascript", ["-e", script]) else { return previous }
+        var next = previous
         var map: [String: String] = [:]
         var tabs: [TerminalLayout.ScriptedTab] = []
         for line in out.split(separator: "\n") {
             let parts = line.components(separatedBy: "\t")
             guard parts.count >= 2 else { continue }
             if parts[0] == "FRONT" {
-                focusedTTY = parts[1]
+                next.focusedTTY = parts[1]
                 continue
             }
             if let topic = Self.topic(fromWindowTitle: parts[1]) {
@@ -893,15 +966,17 @@ final class SessionScanner: @unchecked Sendable {
                 tabs.append(.init(tty: parts[0], frame: Self.frame(fromBounds: parts[2]), title: parts[3]))
             }
         }
-        titleByTTY = map
-        canSeeTabs = AXIsProcessTrusted()
-        if !canSeeTabs {
-            placeByTTY = nil
+        next.titleByTTY = map
+        next.loaded = true
+        next.canSeeTabs = AXIsProcessTrusted()
+        if !next.canSeeTabs {
+            next.placeByTTY = nil
         } else if let strips = TerminalLayout.readStrips() {
-            placeByTTY = TerminalLayout.places(tabs: tabs, strips: strips)
+            next.placeByTTY = TerminalLayout.places(tabs: tabs, strips: strips)
         }
         // Otherwise Terminal didn't answer in time: keep the last layout, which is right far
         // more often than splitting every window apart until the next read.
+        return next
     }
 
     /// AppleScript bounds are "left,top,right,bottom" in the same top-left-origin screen
