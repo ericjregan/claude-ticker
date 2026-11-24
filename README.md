@@ -1,5 +1,7 @@
 # Claude Ticker
 
+> **TRUST BUT VERIFY:** this note describes code as it was when written. Read the code it names (and production) before relying on it.
+
 A macOS menu bar item listing every running Claude Code session, so a dozen Terminal windows
 stay legible at a glance. Single-file Swift (AppKit + SwiftUI), no dependencies.
 

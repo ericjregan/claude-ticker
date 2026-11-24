@@ -1,4 +1,5 @@
 #!/bin/bash
+# TRUST BUT VERIFY: notes here describe the code as it was when written. Read the code (and production) before relying on one.
 # Builds Claude Ticker and installs it as a login agent.
 # Works from wherever you cloned or unzipped this — no paths to edit.
 set -euo pipefail

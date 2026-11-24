@@ -1,0 +1,21 @@
+# TRUST BUT VERIFY: notes here describe the code as it was when written. Read the code (and production) before relying on one.
+# Every note-carrying file holds the TRUST BUT VERIFY line, and a change adds no pointer by line number ("file.py:123";
+# point at code by name: "file.py::function"). scripts/notes_tbv.py is a byte-identical copy of ~/.claude/bin/notes_tbv.py
+# (Eric, 23 Nov 2026: "on every repo in every project").
+name: Notes (trust but verify)
+on:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  notes-trust-but-verify:
+    name: Notes (trust but verify)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      # A pull request checks the files it touches; a manual run checks every file (--all).
+      - run: python scripts/notes_tbv.py ci "origin/${{ github.base_ref || github.event.repository.default_branch }}" ${{ github.event_name != 'pull_request' && '--all' || '' }}

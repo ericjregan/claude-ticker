@@ -1,3 +1,4 @@
+// TRUST BUT VERIFY: notes here describe the code as it was when written. Read the code (and production) before relying on one.
 import AppKit
 import Combine
 import SwiftUI

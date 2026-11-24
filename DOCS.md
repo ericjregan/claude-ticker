@@ -1,5 +1,7 @@
 # Claude Ticker — Reference
 
+> **TRUST BUT VERIFY:** this note describes code as it was when written. Read the code it names (and production) before relying on it.
+
 Everything beyond installing it: what each row means, where the data comes from, what you
 can change, and the platform traps that shaped the implementation.
 
