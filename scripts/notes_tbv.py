@@ -48,8 +48,9 @@ COMMENT = {
     ".py": "#", ".sh": "#", ".bash": "#", ".zsh": "#", ".rb": "#",
     ".ts": "//", ".tsx": "//", ".js": "//", ".jsx": "//", ".mjs": "//", ".cjs": "//", ".go": "//", ".java": "//",
     ".kt": "//", ".swift": "//", ".rs": "//", ".c": "//", ".h": "//", ".cpp": "//", ".cs": "//",
-    ".sql": "--",
 }
+# .sql is NOT covered: migration tools checksum migration files (Prisma, Flyway), so an added line would read as drift.
+# .php is NOT covered: a comment above `<?php` prints onto the page.
 EXEMPT_DIRS = {
     "node_modules", ".next", "dist", "build", "out", "vendor", ".venv", "venv", "__pycache__", "coverage", ".git",
     "public", "static", ".turbo", "site-packages", "generated", "__generated__", ".pytest_cache", ".mypy_cache",
